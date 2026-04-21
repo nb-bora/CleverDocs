@@ -6,17 +6,16 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-
-config = context.config
-
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-
 from app.infrastructure.db.orm.base import Base
 
 # Ensure models are imported so metadata is populated.
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel  # noqa: F401
 from app.infrastructure.db.orm.models.document_model import DocumentModel  # noqa: F401
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
 

@@ -19,7 +19,8 @@ class UnitOfWork(ABC):
             try:
                 self.rollback()
             except Exception:
-                pass
+                # We can't do much more here; don't hide the original exception.
+                return False
         return False
 
     @abstractmethod

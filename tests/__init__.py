@@ -1,1 +1,1 @@
-"""Test suite root."""\n
+"""Test suite root."""

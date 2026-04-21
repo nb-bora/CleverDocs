@@ -40,8 +40,12 @@ def _startup_create_tables() -> None:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    except Exception as e:
+        try:
+            print(f"stdout/stderr reconfigure skipped: {type(e).__name__}: {e}", file=sys.stderr)
+        except Exception:
+            # If even stderr fails, continue startup anyway.
+            ...
 
     # Disable tqdm unicode/progress rendering (EasyOCR downloads) to avoid console encoding issues.
     os.environ.setdefault("TQDM_DISABLE", "1")

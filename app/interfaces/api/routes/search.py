@@ -46,7 +46,7 @@ def search_documents(
             raise HTTPException(status_code=400, detail="Missing X-User-Id header")
         restrict_to_user_id = tenant.user_id
 
-    # Prefer OpenSearch if reachable; fallback to SQL LIKE.
+    # Prefer OpenSearch if reachable; fallback to SQL/FTS below.
     try:
         engine = SearchEngineImpl(
             SearchEngineSettings(
@@ -82,8 +82,8 @@ def search_documents(
                 )
             return SearchResponse(query=query, results=results)
     except Exception:
-        # Fall back to SQL search below.
-        pass
+        # Fall back to SQL search below (OpenSearch is optional in MVP).
+        ...
 
     # SQLite fallback: use FTS5 (diacritics-insensitive + BM25).
     if db.bind is not None and db.bind.dialect.name == "sqlite":
@@ -240,7 +240,7 @@ def search_my_documents_across_orgs(
             merged.sort(key=lambda r: r.score, reverse=True)
             return SearchResponse(query=query, results=merged[:25])
     except Exception:
-        pass
+        ...
 
     if db.bind is not None and db.bind.dialect.name == "sqlite":
         rows = db.execute(
