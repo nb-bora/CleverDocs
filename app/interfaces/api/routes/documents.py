@@ -10,19 +10,26 @@ import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel
 from app.infrastructure.db.orm.models.document_model import DocumentModel
+from app.infrastructure.db.orm.models.job_model import JobModel
+from app.infrastructure.db.fts import upsert_sqlite_fts
 from app.infrastructure.ocr.easyocr_adapter import EasyOcrNotInstalled
 from app.infrastructure.ocr.ocr_service_impl import OcrConfig, OcrServiceImpl, PdfOcrNotInstalled
 from app.infrastructure.db.session import SessionLocal
 from app.infrastructure.search.search_engine_impl import SearchEngineImpl, SearchEngineSettings
 from app.infrastructure.storage.local_file_storage import LocalFileStorage
-from app.interfaces.api.deps import Settings, get_db, get_settings
+from app.interfaces.api.deps import Settings, TenantContext, get_db, get_settings, get_tenant_context
 from app.interfaces.api.schemas.documents import DocumentOut, ProcessDocumentResponse, UploadDocumentResponse
 
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
+
+
+def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
+    return tenant
 
 def _background_ocr_and_index(
     *,
@@ -61,6 +68,14 @@ def _background_ocr_and_index(
         doc.status = "processed"
         doc.failed_reason = None
         db.add(doc)
+        if cleaned and doc.organization_id:
+            upsert_sqlite_fts(
+                db=db,
+                organization_id=doc.organization_id,
+                document_id=doc.id,
+                filename=doc.filename,
+                content=cleaned,
+            )
         db.commit()
 
         if cleaned:
@@ -78,6 +93,7 @@ def _background_ocr_and_index(
                     engine.index_document(
                         document_id=doc.id,
                         organization_id=doc.organization_id,
+                        uploaded_by_user_id=doc.uploaded_by_user_id,
                         filename=doc.filename,
                         content=cleaned,
                         created_at_iso=doc.created_at.isoformat(),
@@ -126,6 +142,7 @@ def upload_document(
     file: UploadFile,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    tenant: TenantContext = Depends(_get_tenant),
 ) -> UploadDocumentResponse:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
@@ -133,8 +150,13 @@ def upload_document(
     storage = _get_storage(settings)
     storage_key = storage.save_upload(file)
 
+    if not tenant.user_id:
+        raise HTTPException(status_code=400, detail="Missing X-User-Id header")
+
     doc = DocumentModel(
         id=str(uuid.uuid4()),
+        organization_id=tenant.organization_id,
+        uploaded_by_user_id=tenant.user_id,
         filename=file.filename,
         status="uploaded",
         storage_key=storage_key,
@@ -143,16 +165,49 @@ def upload_document(
     db.commit()
     db.refresh(doc)
 
+    # Enqueue OCR job right away (worker will process asynchronously).
+    db.add(
+        JobModel(
+            type="OCR",
+            status="queued",
+            organization_id=tenant.organization_id,
+            document_id=doc.id,
+        )
+    )
+    db.commit()
+
     return UploadDocumentResponse(document=DocumentOut.model_validate(doc, from_attributes=True))
+
+
+@router.post("/{document_id}/reindex")
+def reindex_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
+) -> dict:
+    doc = db.get(DocumentModel, document_id)
+    if doc is None or doc.organization_id != tenant.organization_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    db.add(
+        JobModel(
+            type="INDEX",
+            status="queued",
+            organization_id=tenant.organization_id,
+            document_id=doc.id,
+        )
+    )
+    db.commit()
+    return {"status": "queued", "document_id": doc.id}
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
 def get_document(
     document_id: str,
     db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
 ) -> DocumentOut:
     doc = db.get(DocumentModel, document_id)
-    if doc is None:
+    if doc is None or doc.organization_id != tenant.organization_id:
         raise HTTPException(status_code=404, detail="Document not found")
     content = db.get(DocumentContentModel, document_id)
     preview = None
@@ -168,9 +223,10 @@ def process_document(
     background: BackgroundTasks,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    tenant: TenantContext = Depends(_get_tenant),
 ) -> ProcessDocumentResponse:
     doc = db.get(DocumentModel, document_id)
-    if doc is None:
+    if doc is None or doc.organization_id != tenant.organization_id:
         raise HTTPException(status_code=404, detail="Document not found")
 
     def _try_index(cleaned_text: str) -> None:
@@ -192,6 +248,7 @@ def process_document(
             engine.index_document(
                 document_id=doc.id,
                 organization_id=doc.organization_id,
+                uploaded_by_user_id=doc.uploaded_by_user_id,
                 filename=doc.filename,
                 content=cleaned_text,
                 created_at_iso=doc.created_at.isoformat(),
@@ -208,6 +265,15 @@ def process_document(
     existing = db.get(DocumentContentModel, document_id)
     if existing is not None:
         cleaned_existing = existing.cleaned_text or ""
+        if cleaned_existing and doc.organization_id:
+            upsert_sqlite_fts(
+                db=db,
+                organization_id=doc.organization_id,
+                document_id=doc.id,
+                filename=doc.filename,
+                content=cleaned_existing,
+            )
+            db.commit()
         # If already indexed, just return. Otherwise try to index now.
         if doc.status != "indexed" and cleaned_existing:
             _try_index(cleaned_existing)
@@ -300,6 +366,14 @@ def process_document(
     doc.status = "processed"
     doc.failed_reason = None
     db.add(doc)
+    if cleaned and doc.organization_id:
+        upsert_sqlite_fts(
+            db=db,
+            organization_id=doc.organization_id,
+            document_id=doc.id,
+            filename=doc.filename,
+            content=cleaned,
+        )
     db.commit()
 
     if cleaned:
@@ -315,9 +389,10 @@ def download_document_file(
     document_id: str,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
+    tenant: TenantContext = Depends(_get_tenant),
 ) -> FileResponse:
     doc = db.get(DocumentModel, document_id)
-    if doc is None:
+    if doc is None or doc.organization_id != tenant.organization_id:
         raise HTTPException(status_code=404, detail="Document not found")
 
     storage = _get_storage(settings)

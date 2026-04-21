@@ -1082,6 +1082,23 @@ Ce schéma compare un déploiement **MVP** et un déploiement **production**.
 - Ça montre que l’architecture est pensée “long terme” dès le départ.
 
 ## 🧭 Roadmap (livrables)
+### 📌 État réel (aujourd’hui)
+L’objectif du README est de décrire la **cible**. Pour éviter toute ambiguïté, voici l’état **réel** du repo à date :
+- **✅ Fait** : le code est présent et fonctionne (MVP).
+- **🟡 Partiel** : présent mais incomplet / non sécurisé (MVP en cours).
+- **❌ Pas encore** : décrit mais non implémenté.
+
+**Synthèse**
+- **✅ Phases 0 → 5** : socle, upload, OCR (images + PDF scannés), pipeline asynchrone (workers + queue DB), recherche (SQLite FTS fallback + OpenSearch) + endpoints admin jobs minimal.
+- **🟡 Phase 8** : retry/backoff ajouté sur la queue DB (via `next_run_at`) + reindex manuel, mais observabilité/metrics/audit restent à faire.
+- **❌ Phases 6 → 9** : multi-tenant strict (Organization/Membership/TenantContext), permissions/RBAC, audit log, outbox.
+
+**Manques qui expliquent “ça ne coche pas tout”**
+- **Multi-tenant strict** : pas encore de `TenantContext` appliqué systématiquement (DB + index + API).
+- **AuthZ/RBAC** : permissions et endpoints org/memberships non implémentés (les fichiers “auth” sont des stubs).
+- **Audit log** : aucune table/écriture d’audit sur upload/search/download/admin.
+- **Outbox** : pas d’outbox transactionnelle ni dispatcher (fiabilité événementielle).
+
 ### 🟢 MVP (1er incrément “end-to-end”)
 - Upload + stockage fichiers
 - Création `Document` + statut

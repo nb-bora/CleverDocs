@@ -20,6 +20,9 @@ class DocumentModel(Base):
     # For now it's optional until Organization/Membership are implemented.
     organization_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
 
+    # Ownership: used for per-user access rules within/ across organizations.
+    uploaded_by_user_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+
     filename: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), index=True, default="uploaded")
 
