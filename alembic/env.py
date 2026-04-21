@@ -12,17 +12,19 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# IMPORTANT: for now, we don't import ORM models metadata.
-# When SQLAlchemy models are implemented, set:
-# from app.infrastructure.db.orm.base import Base
-# target_metadata = Base.metadata
-target_metadata = None
+from app.infrastructure.db.orm.base import Base
+
+# Ensure models are imported so metadata is populated.
+from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel  # noqa: F401
+from app.infrastructure.db.orm.models.document_model import DocumentModel  # noqa: F401
+
+target_metadata = Base.metadata
 
 
 def get_url() -> str:
     # Alembic supports env var interpolation with %(DATABASE_URL)s, but we also
     # provide a fallback so `alembic` works in more contexts.
-    return os.getenv("DATABASE_URL", "postgresql+psycopg://cleverdocs:cleverdocs@localhost:5432/cleverdocs")
+    return os.getenv("DATABASE_URL", "sqlite:///./cleverdocs.db")
 
 
 def run_migrations_offline() -> None:

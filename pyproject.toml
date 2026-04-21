@@ -24,6 +24,8 @@ dev = [
 ]
 ocr = [
   "easyocr>=1.7.1",
+  "pillow>=10.0",
+  "pymupdf>=1.24",
 ]
 
 [tool.ruff]

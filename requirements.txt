@@ -12,3 +12,8 @@ httpx
 ruff
 pytest
 
+# ocr (optional, recommended for images)
+pillow
+easyocr
+pymupdf
+

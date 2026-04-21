@@ -1217,6 +1217,26 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+#### 🧠 OCR (images) — dépendances
+Pour activer l’OCR sur **images/scans** via **EasyOCR**, installe :
+
+```bash
+pip install easyocr pillow
+```
+
+#### 📄 OCR (PDF scannés) — dépendances
+Pour activer l’OCR sur **PDF scannés** (rendu pages → images), installe :
+
+```bash
+pip install pymupdf
+```
+
+Si tu utilises `pyproject.toml` :
+
+```bash
+pip install -e ".[ocr]"
+```
+
 4. Créer un fichier `.env` à partir de `.env.example` (et adapter si besoin)
 
 5. Lancer l’API
@@ -1257,6 +1277,7 @@ alembic upgrade head
 - **DB** : `DATABASE_URL`
 - **Search** : `OPENSEARCH_URL`, `OPENSEARCH_INDEX_PREFIX`
 - **Storage** : `STORAGE_BACKEND`, `LOCAL_STORAGE_DIR`
+- **OCR** : `OCR_LANGS`, `OCR_GPU`
 
 ## 📌 Statut du dépôt
 Ce dépôt contient actuellement la **documentation de cadrage**.
