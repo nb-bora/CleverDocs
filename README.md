@@ -1183,6 +1183,81 @@ Objectif : **ne jamais coder “trop large”**. Chaque micro-phase a une **sort
 
 ---
 
+## 🏁 Installation & lancement (local et Docker)
+### ✅ Prérequis
+- **Python** : 3.11+
+- (option) **Docker** : pour PostgreSQL + OpenSearch
+
+### 📦 Fichiers “démarrage” présents dans le repo
+- **`pyproject.toml`** : définition du projet + dépendances (recommandé long terme)
+- **`requirements.txt`** : installation rapide via pip
+- **`.env.example`** : variables d’environnement (copier vers `.env`)
+- **`.gitignore`** : ignore Python + storage local
+- **`Dockerfile`** + **`docker-compose.yml`** : démarrage API + Postgres + OpenSearch
+- **`alembic/`** + **`alembic.ini`** : squelette migrations DB
+- **`scripts/`** : utilitaires (bootstrap structure, check structure, etc.)
+
+### 🧪 Lancement rapide (local, sans Docker)
+1. Créer un environnement virtuel
+
+```bash
+python -m venv .venv
+```
+
+2. Activer l’environnement
+
+```bash
+# Windows (PowerShell)
+.venv\\Scripts\\Activate.ps1
+```
+
+3. Installer les dépendances
+
+```bash
+pip install -r requirements.txt
+```
+
+4. Créer un fichier `.env` à partir de `.env.example` (et adapter si besoin)
+
+5. Lancer l’API
+
+```bash
+uvicorn app.interfaces.api.main:app --reload
+```
+
+6. Vérifier
+- `GET /health` → `{"status":"ok"}`
+
+### 🐳 Lancement avec Docker (recommandé)
+Cela démarre :
+- l’API,
+- PostgreSQL,
+- OpenSearch.
+
+```bash
+docker compose up --build
+```
+
+### 🗃️ Migrations DB (Alembic)
+> Le squelette Alembic est présent (`alembic/`). Les premières migrations arriveront quand les modèles ORM seront implémentés.
+
+Créer une migration :
+
+```bash
+alembic revision -m "init"
+```
+
+Appliquer les migrations :
+
+```bash
+alembic upgrade head
+```
+
+### 🔧 Variables d’environnement (résumé)
+- **DB** : `DATABASE_URL`
+- **Search** : `OPENSEARCH_URL`, `OPENSEARCH_INDEX_PREFIX`
+- **Storage** : `STORAGE_BACKEND`, `LOCAL_STORAGE_DIR`
+
 ## 📌 Statut du dépôt
 Ce dépôt contient actuellement la **documentation de cadrage**.
 La prochaine étape est d’implémenter le squelette `app/` et le flux minimal :

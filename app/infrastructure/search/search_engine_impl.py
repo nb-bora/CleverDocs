@@ -1,0 +1,1 @@
+"""Search engine implementation (placeholder)."""

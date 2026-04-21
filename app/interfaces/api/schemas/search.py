@@ -1,0 +1,1 @@
+"""Search schemas (placeholder)."""

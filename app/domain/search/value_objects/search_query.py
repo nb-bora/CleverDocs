@@ -1,0 +1,1 @@
+"""SearchQuery value object."""

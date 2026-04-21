@@ -1,0 +1,1 @@
+"""SearchResult read model."""

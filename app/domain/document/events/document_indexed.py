@@ -1,0 +1,1 @@
+"""Event: indexed in search."""

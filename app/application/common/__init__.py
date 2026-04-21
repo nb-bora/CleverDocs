@@ -1,0 +1,1 @@
+"""Application common building blocks."""
