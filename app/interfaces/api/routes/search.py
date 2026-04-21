@@ -46,6 +46,8 @@ def search_documents(
             raise HTTPException(status_code=400, detail="Missing X-User-Id header")
         restrict_to_user_id = tenant.user_id
 
+    include_archived = False
+
     # Prefer OpenSearch if reachable; fallback to SQL/FTS below.
     try:
         engine = SearchEngineImpl(
@@ -59,6 +61,7 @@ def search_documents(
                 q=query,
                 organization_id=tenant.organization_id,
                 uploaded_by_user_id=restrict_to_user_id,
+                include_archived=include_archived,
                 size=25,
             )
             hits = resp.get("hits", {}).get("hits", [])
@@ -87,44 +90,32 @@ def search_documents(
 
     # SQLite fallback: use FTS5 (diacritics-insensitive + BM25).
     if db.bind is not None and db.bind.dialect.name == "sqlite":
-        if restrict_to_user_id is None:
-            rows = db.execute(
-                sql_text(
-                    """
-                    SELECT
-                      f.document_id,
-                      f.filename,
-                      bm25(f) AS bm25_score,
-                      snippet(f, 2, '[', ']', '…', 12) AS snip
-                    FROM document_search_fts f
-                    WHERE f.organization_id = :org_id
-                      AND f MATCH :q
-                    ORDER BY bm25_score ASC
-                    LIMIT 25
-                    """
-                ),
-                {"q": query, "org_id": tenant.organization_id},
-            ).all()
-        else:
-            rows = db.execute(
-                sql_text(
-                    """
-                    SELECT
-                      f.document_id,
-                      f.filename,
-                      bm25(f) AS bm25_score,
-                      snippet(f, 2, '[', ']', '…', 12) AS snip
-                    FROM document_search_fts f
-                    JOIN documents d ON d.id = f.document_id
-                    WHERE f.organization_id = :org_id
-                      AND d.uploaded_by_user_id = :user_id
-                      AND f MATCH :q
-                    ORDER BY bm25_score ASC
-                    LIMIT 25
-                    """
-                ),
-                {"q": query, "org_id": tenant.organization_id, "user_id": restrict_to_user_id},
-            ).all()
+        rows = db.execute(
+            sql_text(
+                """
+                SELECT
+                  f.document_id,
+                  f.filename,
+                  bm25(f) AS bm25_score,
+                  snippet(f, 2, '[', ']', '…', 12) AS snip
+                FROM document_search_fts f
+                JOIN documents d ON d.id = f.document_id
+                WHERE f.organization_id = :org_id
+                  AND (:user_id IS NULL OR d.uploaded_by_user_id = :user_id)
+                  AND d.status != 'deleted'
+                  AND (:include_archived = 1 OR d.status != 'archived')
+                  AND f MATCH :q
+                ORDER BY bm25_score ASC
+                LIMIT 25
+                """
+            ),
+            {
+                "q": query,
+                "org_id": tenant.organization_id,
+                "user_id": restrict_to_user_id,
+                "include_archived": (1 if include_archived else 0),
+            },
+        ).all()
 
         results: list[SearchResultItem] = []
         for doc_id, filename, bm25_score, snip in rows:
@@ -147,11 +138,14 @@ def search_documents(
         select(DocumentModel, DocumentContentModel)
         .join(DocumentContentModel, DocumentContentModel.document_id == DocumentModel.id)
         .where(DocumentModel.organization_id == tenant.organization_id)
+        .where(DocumentModel.status != "deleted")
         .where(DocumentContentModel.cleaned_text.ilike(like))
         .limit(25)
     )
     if restrict_to_user_id is not None:
         stmt = stmt.where(DocumentModel.uploaded_by_user_id == restrict_to_user_id)
+    if not include_archived:
+        stmt = stmt.where(DocumentModel.status != "archived")
 
     results: list[SearchResultItem] = []
     for doc, content in db.execute(stmt).all():
@@ -217,6 +211,7 @@ def search_my_documents_across_orgs(
                     q=query,
                     organization_id=org_id,
                     uploaded_by_user_id=user.user_id,
+                    include_archived=False,
                     size=25,
                 )
                 hits = resp.get("hits", {}).get("hits", [])
@@ -257,6 +252,8 @@ def search_my_documents_across_orgs(
                 WHERE m.user_id = :user_id
                   AND m.status = 'active'
                   AND d.uploaded_by_user_id = :user_id
+                  AND d.status != 'deleted'
+                  AND d.status != 'archived'
                   AND f MATCH :q
                 ORDER BY bm25_score ASC
                 LIMIT 25
@@ -285,6 +282,8 @@ def search_my_documents_across_orgs(
         .where(MembershipModel.user_id == user.user_id)
         .where(MembershipModel.status == "active")
         .where(DocumentModel.uploaded_by_user_id == user.user_id)
+        .where(DocumentModel.status != "deleted")
+        .where(DocumentModel.status != "archived")
         .where(DocumentContentModel.cleaned_text.ilike(like))
         .limit(25)
     )

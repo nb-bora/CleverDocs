@@ -14,21 +14,154 @@ from sqlalchemy.orm import Session
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel
 from app.infrastructure.db.orm.models.document_model import DocumentModel
 from app.infrastructure.db.orm.models.job_model import JobModel
+from app.infrastructure.db.orm.models.membership_model import MembershipModel
 from app.infrastructure.db.fts import upsert_sqlite_fts
 from app.infrastructure.ocr.easyocr_adapter import EasyOcrNotInstalled
 from app.infrastructure.ocr.ocr_service_impl import OcrConfig, OcrServiceImpl, PdfOcrNotInstalled
 from app.infrastructure.db.session import SessionLocal
 from app.infrastructure.search.search_engine_impl import SearchEngineImpl, SearchEngineSettings
 from app.infrastructure.storage.local_file_storage import LocalFileStorage
-from app.interfaces.api.deps import Settings, TenantContext, get_db, get_settings, get_tenant_context
+from app.interfaces.api.deps import Settings, TenantContext, UserContext, get_db, get_settings, get_tenant_context, get_user_context
 from app.interfaces.api.schemas.documents import DocumentOut, ProcessDocumentResponse, UploadDocumentResponse
 
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
 
+_ADMIN_ROLES = {"owner", "admin"}
+_TERMINAL_DOC_STATUSES = {"deleted"}
+
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
     return tenant
+
+
+def _can_access_document(*, tenant: TenantContext, doc: DocumentModel) -> bool:
+    if doc.organization_id != tenant.organization_id:
+        return False
+    if doc.status in _TERMINAL_DOC_STATUSES:
+        return False
+    if (tenant.role or "") in _ADMIN_ROLES:
+        return True
+    return bool(tenant.user_id) and (doc.uploaded_by_user_id == tenant.user_id)
+
+
+@router.get("/mine")
+def list_my_documents_grouped_by_organization(
+    db: Session = Depends(get_db),
+    user: UserContext = Depends(get_user_context),
+) -> dict:
+    """Retourne tous les documents uploadés par l'utilisateur, regroupés par organisation.
+
+    L'utilisateur ne voit que:
+    - les documents où `uploaded_by_user_id == X-User-Id`
+    - et uniquement dans les organisations où il a une membership active.
+    """
+    rows = (
+        db.query(DocumentModel)
+        .join(MembershipModel, MembershipModel.organization_id == DocumentModel.organization_id)
+        .filter(MembershipModel.user_id == user.user_id)
+        .filter(MembershipModel.status == "active")
+        .filter(DocumentModel.uploaded_by_user_id == user.user_id)
+        .filter(DocumentModel.status != "deleted")
+        .order_by(DocumentModel.organization_id.asc(), DocumentModel.created_at.desc())
+        .all()
+    )
+
+    grouped: dict[str, list[DocumentOut]] = {}
+    for doc in rows:
+        org_id = doc.organization_id or "unknown"
+        grouped.setdefault(org_id, []).append(DocumentOut.model_validate(doc, from_attributes=True))
+
+    return {
+        "user_id": user.user_id,
+        "organizations": [
+            {"organization_id": org_id, "documents": docs} for org_id, docs in grouped.items()
+        ],
+    }
+
+
+@router.get("", response_model=list[DocumentOut])
+def list_documents(
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
+    include_archived: bool = False,
+) -> list[DocumentOut]:
+    q = db.query(DocumentModel).filter(DocumentModel.organization_id == tenant.organization_id)
+    q = q.filter(DocumentModel.status != "deleted")
+    if not include_archived:
+        q = q.filter(DocumentModel.status != "archived")
+    if (tenant.role or "") not in _ADMIN_ROLES:
+        if not tenant.user_id:
+            raise HTTPException(status_code=400, detail="Missing X-User-Id header")
+        q = q.filter(DocumentModel.uploaded_by_user_id == tenant.user_id)
+    items = q.order_by(DocumentModel.created_at.desc()).limit(200).all()
+    return [DocumentOut.model_validate(d, from_attributes=True) for d in items]
+
+
+@router.patch("/{document_id}", response_model=DocumentOut)
+def update_document(
+    document_id: str,
+    filename: str,
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
+) -> DocumentOut:
+    doc = db.get(DocumentModel, document_id)
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc.filename = filename
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return DocumentOut.model_validate(doc, from_attributes=True)
+
+
+@router.post("/{document_id}/archive", response_model=DocumentOut)
+def archive_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
+) -> DocumentOut:
+    doc = db.get(DocumentModel, document_id)
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc.status = "archived"
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return DocumentOut.model_validate(doc, from_attributes=True)
+
+
+@router.post("/{document_id}/unarchive", response_model=DocumentOut)
+def unarchive_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
+) -> DocumentOut:
+    doc = db.get(DocumentModel, document_id)
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status == "archived":
+        # In MVP, we don't track previous status; restore to processed.
+        doc.status = "processed"
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return DocumentOut.model_validate(doc, from_attributes=True)
+
+
+@router.delete("/{document_id}")
+def delete_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(_get_tenant),
+) -> dict:
+    doc = db.get(DocumentModel, document_id)
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc.status = "deleted"
+    db.add(doc)
+    db.commit()
+    return {"status": "deleted", "document_id": doc.id}
 
 def _background_ocr_and_index(
     *,
@@ -93,6 +226,7 @@ def _background_ocr_and_index(
                         document_id=doc.id,
                         organization_id=doc.organization_id,
                         uploaded_by_user_id=doc.uploaded_by_user_id,
+                        status=doc.status,
                         filename=doc.filename,
                         content=cleaned,
                         created_at_iso=doc.created_at.isoformat(),
@@ -185,7 +319,7 @@ def reindex_document(
     tenant: TenantContext = Depends(_get_tenant),
 ) -> dict:
     doc = db.get(DocumentModel, document_id)
-    if doc is None or doc.organization_id != tenant.organization_id:
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
     db.add(
         JobModel(
@@ -206,7 +340,7 @@ def get_document(
     tenant: TenantContext = Depends(_get_tenant),
 ) -> DocumentOut:
     doc = db.get(DocumentModel, document_id)
-    if doc is None or doc.organization_id != tenant.organization_id:
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
     content = db.get(DocumentContentModel, document_id)
     preview = None
@@ -225,7 +359,7 @@ def process_document(
     tenant: TenantContext = Depends(_get_tenant),
 ) -> ProcessDocumentResponse:
     doc = db.get(DocumentModel, document_id)
-    if doc is None or doc.organization_id != tenant.organization_id:
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
 
     def _try_index(cleaned_text: str) -> None:
@@ -248,6 +382,7 @@ def process_document(
                 document_id=doc.id,
                 organization_id=doc.organization_id,
                 uploaded_by_user_id=doc.uploaded_by_user_id,
+                status=doc.status,
                 filename=doc.filename,
                 content=cleaned_text,
                 created_at_iso=doc.created_at.isoformat(),
@@ -391,7 +526,7 @@ def download_document_file(
     tenant: TenantContext = Depends(_get_tenant),
 ) -> FileResponse:
     doc = db.get(DocumentModel, document_id)
-    if doc is None or doc.organization_id != tenant.organization_id:
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
 
     storage = _get_storage(settings)

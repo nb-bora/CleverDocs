@@ -50,6 +50,7 @@ class SearchEngineImpl:
                     "organization_id": {"type": "keyword"},
                     "document_id": {"type": "keyword"},
                     "uploaded_by_user_id": {"type": "keyword"},
+                    "status": {"type": "keyword"},
                     "filename": {
                         "type": "text",
                         "analyzer": "cleverdocs_folded",
@@ -71,6 +72,7 @@ class SearchEngineImpl:
         document_id: str,
         organization_id: str | None,
         uploaded_by_user_id: str | None,
+        status: str | None,
         filename: str,
         content: str,
         created_at_iso: str,
@@ -80,6 +82,7 @@ class SearchEngineImpl:
             "organization_id": organization_id,
             "document_id": document_id,
             "uploaded_by_user_id": uploaded_by_user_id,
+            "status": status,
             "filename": filename,
             "content": content,
             "created_at": created_at_iso,
@@ -92,6 +95,7 @@ class SearchEngineImpl:
         q: str,
         organization_id: str | None = None,
         uploaded_by_user_id: str | None = None,
+        include_archived: bool = False,
         size: int = 25,
     ) -> dict:
         index = self.ensure_documents_index()
@@ -127,17 +131,21 @@ class SearchEngineImpl:
                 }
             }
         ]
-        filt = []
+        filt: list[dict] = []
         if organization_id is not None:
             filt.append({"term": {"organization_id": organization_id}})
         if uploaded_by_user_id is not None:
             filt.append({"term": {"uploaded_by_user_id": uploaded_by_user_id}})
+        must_not: list[dict] = []
+        if not include_archived:
+            must_not.append({"term": {"status": "archived"}})
+        must_not.append({"term": {"status": "deleted"}})
 
         query = {
             "size": size,
             "query": {
                 "function_score": {
-                    "query": {"bool": {"must": must, "filter": filt}},
+                    "query": {"bool": {"must": must, "filter": filt, "must_not": must_not}},
                     "boost_mode": "sum",
                     "score_mode": "sum",
                     # Soft recency boost (doesn't dominate).

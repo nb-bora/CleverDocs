@@ -35,6 +35,10 @@ class CreateOrganizationRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
 
+class UpdateOrganizationRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+
+
 class MembershipOut(BaseModel):
     id: str
     user_id: str
@@ -46,6 +50,11 @@ class MembershipOut(BaseModel):
 class AddMemberRequest(BaseModel):
     user_email: str = Field(min_length=3, max_length=320)
     role: str = Field(default="member", min_length=1, max_length=32)
+
+
+class UpdateMemberRequest(BaseModel):
+    role: str | None = Field(default=None, min_length=1, max_length=32)
+    status: str | None = Field(default=None, min_length=1, max_length=32)
 
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
@@ -93,6 +102,98 @@ def create_organization(
     db.commit()
     db.refresh(org)
     return OrganizationOut.model_validate(org, from_attributes=True)
+
+
+@router.get("/{organization_id}", response_model=OrganizationOut)
+def get_organization(
+    organization_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> OrganizationOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    org = db.get(OrganizationModel, organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return OrganizationOut.model_validate(org, from_attributes=True)
+
+
+@router.patch("/{organization_id}", response_model=OrganizationOut)
+def update_organization(
+    organization_id: str,
+    body: UpdateOrganizationRequest,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> OrganizationOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    org = db.get(OrganizationModel, organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if body.name is not None:
+        org.name = body.name
+    db.add(org)
+    db.commit()
+    db.refresh(org)
+    return OrganizationOut.model_validate(org, from_attributes=True)
+
+
+@router.post("/{organization_id}/suspend", response_model=OrganizationOut)
+def suspend_organization(
+    organization_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> OrganizationOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    org = db.get(OrganizationModel, organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    org.status = "suspended"
+    db.add(org)
+    db.commit()
+    db.refresh(org)
+    return OrganizationOut.model_validate(org, from_attributes=True)
+
+
+@router.post("/{organization_id}/activate", response_model=OrganizationOut)
+def activate_organization(
+    organization_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> OrganizationOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    org = db.get(OrganizationModel, organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    org.status = "active"
+    db.add(org)
+    db.commit()
+    db.refresh(org)
+    return OrganizationOut.model_validate(org, from_attributes=True)
+
+
+@router.delete("/{organization_id}")
+def delete_organization(
+    organization_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> dict:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    org = db.get(OrganizationModel, organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    # Soft delete in MVP: mark suspended.
+    org.status = "suspended"
+    db.add(org)
+    db.commit()
+    return {"status": "suspended", "organization_id": org.id}
 
 
 @router.get("/{organization_id}/members", response_model=list[MembershipOut])
@@ -160,3 +261,87 @@ def add_member(
     db.commit()
     db.refresh(membership)
     return MembershipOut.model_validate(membership, from_attributes=True)
+
+
+@router.patch("/{organization_id}/members/{membership_id}", response_model=MembershipOut)
+def update_member(
+    organization_id: str,
+    membership_id: str,
+    body: UpdateMemberRequest,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> MembershipOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    m = db.get(MembershipModel, membership_id)
+    if m is None or m.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Membership not found")
+    if body.role is not None:
+        m.role = body.role
+    if body.status is not None:
+        m.status = body.status
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return MembershipOut.model_validate(m, from_attributes=True)
+
+
+@router.post("/{organization_id}/members/{membership_id}/suspend", response_model=MembershipOut)
+def suspend_member(
+    organization_id: str,
+    membership_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> MembershipOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    m = db.get(MembershipModel, membership_id)
+    if m is None or m.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Membership not found")
+    m.status = "suspended"
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return MembershipOut.model_validate(m, from_attributes=True)
+
+
+@router.post("/{organization_id}/members/{membership_id}/activate", response_model=MembershipOut)
+def activate_member(
+    organization_id: str,
+    membership_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> MembershipOut:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    m = db.get(MembershipModel, membership_id)
+    if m is None or m.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Membership not found")
+    m.status = "active"
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return MembershipOut.model_validate(m, from_attributes=True)
+
+
+@router.delete("/{organization_id}/members/{membership_id}")
+def remove_member(
+    organization_id: str,
+    membership_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> dict:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_admin(tenant)
+    m = db.get(MembershipModel, membership_id)
+    if m is None or m.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Membership not found")
+    # Soft delete for MVP: set a terminal status.
+    m.status = "removed"
+    db.add(m)
+    db.commit()
+    return {"status": "removed", "membership_id": m.id}

@@ -109,6 +109,7 @@ def process_job(db: Session, job: JobModel, settings: Settings) -> None:
             document_id=doc.id,
             organization_id=doc.organization_id,
             uploaded_by_user_id=doc.uploaded_by_user_id,
+            status=doc.status,
             filename=doc.filename,
             content=cleaned,
             created_at_iso=doc.created_at.isoformat(),
