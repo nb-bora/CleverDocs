@@ -74,11 +74,15 @@ def process_job(db: Session, job: JobModel, settings: Settings) -> None:
     content = db.get(DocumentContentModel, doc.id)
     cleaned = (content.cleaned_text if content else "") or ""
     if not cleaned:
-        job.status = "failed"
-        job.last_error = "EMPTY_CONTENT"
-        db.add(job)
-        db.commit()
-        return
+        # If document is deleted, we still want to push status to the index (best-effort).
+        if doc.status == "deleted":
+            cleaned = ""
+        else:
+            job.status = "failed"
+            job.last_error = "EMPTY_CONTENT"
+            db.add(job)
+            db.commit()
+            return
 
     try:
         engine = SearchEngineImpl(
@@ -101,22 +105,19 @@ def process_job(db: Session, job: JobModel, settings: Settings) -> None:
             db.commit()
             return
 
-        doc.status = "indexing_pending"
-        db.add(doc)
-        db.commit()
-
         engine.index_document(
             document_id=doc.id,
             organization_id=doc.organization_id,
             uploaded_by_user_id=doc.uploaded_by_user_id,
-            status=doc.status,
+            status=doc.status if doc.status in {"archived", "deleted"} else "indexed",
             filename=doc.filename,
             content=cleaned,
             created_at_iso=doc.created_at.isoformat(),
         )
 
-        doc.status = "indexed"
-        doc.failed_reason = None
+        if doc.status not in {"archived", "deleted"}:
+            doc.status = "indexed"
+            doc.failed_reason = None
         job.status = "succeeded"
         job.last_error = None
         db.add_all([doc, job])
@@ -129,7 +130,7 @@ def process_job(db: Session, job: JobModel, settings: Settings) -> None:
             job.status = "queued"
             job.schedule_in(seconds=min(600, 5 * (2 ** min(job.attempts, 8))))
         else:
-            job.status = "failed"
+            job.status = "dead"
         db.add_all([doc, job])
         db.commit()
 

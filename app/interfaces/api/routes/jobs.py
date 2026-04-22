@@ -13,11 +13,12 @@ from sqlalchemy.orm import Session
 
 from app.infrastructure.db.orm.models.job_model import JobModel
 from app.interfaces.api.deps import TenantContext, get_db, get_tenant_context
+from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
 
 
 router = APIRouter(prefix="/v1/jobs", tags=["jobs"])
 
-_ADMIN_ROLES = {"owner", "admin"}
+_authz = AuthorizationPolicy()
 
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
@@ -25,7 +26,11 @@ def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantCo
 
 
 def _require_admin(tenant: TenantContext) -> None:
-    if (tenant.role or "") not in _ADMIN_ROLES:
+    if not _authz.is_admin(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
         raise HTTPException(status_code=403, detail="ADMIN_REQUIRED")
 
 
@@ -145,6 +150,76 @@ def retry_failed_jobs(
         select(JobModel.id)
         .where(JobModel.organization_id == tenant.organization_id)
         .where(JobModel.status == "failed")
+        .order_by(JobModel.updated_at.desc())
+    )
+    if type:
+        sel = sel.where(JobModel.type == type)
+    job_ids = [row[0] for row in db.execute(sel.limit(limit)).all()]
+    if not job_ids:
+        return {"retried": 0, "type": type, "limit": limit}
+
+    upd = (
+        update(JobModel)
+        .where(JobModel.id.in_(job_ids))
+        .values(
+            status="queued",
+            locked_by=None,
+            locked_at=None,
+            next_run_at=None,
+            last_error=None,
+            attempts=(0 if reset_attempts else JobModel.attempts),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = db.execute(upd)
+    db.commit()
+    return {"retried": int(result.rowcount or 0), "type": type, "limit": limit}
+
+
+@router.get("/dead")
+def list_dead_jobs(
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    db: Annotated[Session, Depends(get_db)] = None,
+    tenant: Annotated[TenantContext, Depends(_get_tenant)] = None,
+) -> list[dict]:
+    _require_admin(tenant)
+    stmt = (
+        select(JobModel)
+        .where(JobModel.organization_id == tenant.organization_id)
+        .where(JobModel.status == "dead")
+        .order_by(JobModel.updated_at.desc())
+        .limit(limit)
+    )
+    items = db.execute(stmt).scalars().all()
+    return [
+        {
+            "id": j.id,
+            "type": j.type,
+            "status": j.status,
+            "document_id": j.document_id,
+            "attempts": j.attempts,
+            "max_attempts": j.max_attempts,
+            "last_error": j.last_error,
+            "created_at": j.created_at.isoformat(),
+            "updated_at": j.updated_at.isoformat(),
+        }
+        for j in items
+    ]
+
+
+@router.post("/retry_dead")
+def retry_dead_jobs(
+    type: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+    reset_attempts: Annotated[bool, Query()] = True,
+    db: Annotated[Session, Depends(get_db)] = None,
+    tenant: Annotated[TenantContext, Depends(_get_tenant)] = None,
+) -> dict:
+    _require_admin(tenant)
+    sel = (
+        select(JobModel.id)
+        .where(JobModel.organization_id == tenant.organization_id)
+        .where(JobModel.status == "dead")
         .order_by(JobModel.updated_at.desc())
     )
     if type:

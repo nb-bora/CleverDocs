@@ -74,6 +74,12 @@ def process_job(db: Session, job: JobModel, settings: Settings) -> None:
         db.add(job)
         db.commit()
         return
+    if doc.status == "deleted":
+        job.status = "cancelled"
+        job.last_error = "DOCUMENT_DELETED"
+        db.add(job)
+        db.commit()
+        return
 
     storage = LocalFileStorage(root_dir=settings.local_storage_dir)
     path = storage.resolve(doc.storage_key)
@@ -152,7 +158,7 @@ def process_job(db: Session, job: JobModel, settings: Settings) -> None:
             job.status = "queued"
             job.schedule_in(seconds=min(300, 2 ** min(job.attempts, 8)))
         else:
-            job.status = "failed"
+            job.status = "dead"
         db.add_all([doc, job])
         db.commit()
 

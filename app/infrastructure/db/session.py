@@ -114,3 +114,34 @@ def ensure_sqlite_tenant_schema() -> None:
         if "uploaded_by_user_id" not in col_names:
             conn.execute(text("ALTER TABLE documents ADD COLUMN uploaded_by_user_id VARCHAR(36)"))
 
+
+def ensure_sqlite_identity_schema() -> None:
+    """Evolve SQLite schema for auth/identity without Alembic (dev-only MVP)."""
+    url = str(ENGINE.url)
+    if not url.startswith("sqlite"):
+        return
+
+    with ENGINE.begin() as conn:
+        user_cols = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        if user_cols:
+            user_col_names = {c[1] for c in user_cols}
+            if "password_hash" not in user_col_names:
+                conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255)"))
+
+        # Refresh tokens table (new in auth phase)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS refresh_tokens (
+                  id VARCHAR(36) PRIMARY KEY,
+                  user_id VARCHAR(36) NOT NULL,
+                  token_hash VARCHAR(128) NOT NULL UNIQUE,
+                  expires_at DATETIME NOT NULL,
+                  revoked_at DATETIME,
+                  created_at DATETIME,
+                  updated_at DATETIME
+                )
+                """
+            )
+        )
+

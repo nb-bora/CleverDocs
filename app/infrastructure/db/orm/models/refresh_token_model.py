@@ -1,4 +1,7 @@
-"""ORM model: organization (tenant)."""
+"""ORM model: refresh tokens (opaque, stored hashed).
+
+We store refresh tokens hashed so DB leaks don't immediately grant access.
+"""
 
 from __future__ import annotations
 
@@ -11,15 +14,19 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.infrastructure.db.orm.base import Base
 
 
-class OrganizationModel(Base):
-    __tablename__ = "organizations"
+class RefreshTokenModel(Base):
+    __tablename__ = "refresh_tokens"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    owner_user_id: Mapped[str] = mapped_column(String(36), index=True)
-    status: Mapped[str] = mapped_column(String(32), default="active")  # active|suspended
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
     )
+

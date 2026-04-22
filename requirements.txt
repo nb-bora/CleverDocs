@@ -7,6 +7,8 @@ sqlalchemy
 psycopg[binary]
 alembic
 httpx
+passlib[bcrypt]
+python-jose[cryptography]
 
 # dev
 ruff

@@ -11,6 +11,18 @@ from app.infrastructure.db.orm.base import Base
 # Ensure models are imported so metadata is populated.
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel  # noqa: F401
 from app.infrastructure.db.orm.models.document_model import DocumentModel  # noqa: F401
+from app.infrastructure.db.orm.models.document_version_model import DocumentVersionModel  # noqa: F401
+from app.infrastructure.db.orm.models.job_model import JobModel  # noqa: F401
+from app.infrastructure.db.orm.models.organization_model import OrganizationModel  # noqa: F401
+from app.infrastructure.db.orm.models.user_model import UserModel  # noqa: F401
+from app.infrastructure.db.orm.models.membership_model import MembershipModel  # noqa: F401
+from app.infrastructure.db.orm.models.refresh_token_model import RefreshTokenModel  # noqa: F401
+from app.infrastructure.db.orm.models.audit_log_model import AuditLogModel  # noqa: F401
+from app.infrastructure.db.orm.models.invitation_model import InvitationModel  # noqa: F401
+from app.infrastructure.db.orm.models.outbox_event_model import OutboxEventModel  # noqa: F401
+from app.infrastructure.db.orm.models.permission_model import PermissionModel  # noqa: F401
+from app.infrastructure.db.orm.models.role_model import RoleModel  # noqa: F401
+from app.infrastructure.db.orm.models.role_permission_model import RolePermissionModel  # noqa: F401
 
 config = context.config
 

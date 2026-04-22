@@ -9,10 +9,12 @@ import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel
 from app.infrastructure.db.orm.models.document_model import DocumentModel
+from app.infrastructure.db.orm.models.document_version_model import DocumentVersionModel
 from app.infrastructure.db.orm.models.job_model import JobModel
 from app.infrastructure.db.orm.models.membership_model import MembershipModel
 from app.infrastructure.db.fts import upsert_sqlite_fts
@@ -21,14 +23,17 @@ from app.infrastructure.ocr.ocr_service_impl import OcrConfig, OcrServiceImpl, P
 from app.infrastructure.db.session import SessionLocal
 from app.infrastructure.search.search_engine_impl import SearchEngineImpl, SearchEngineSettings
 from app.infrastructure.storage.local_file_storage import LocalFileStorage
-from app.interfaces.api.deps import Settings, TenantContext, UserContext, get_db, get_settings, get_tenant_context, get_user_context
+from app.infrastructure.messaging.outbox.outbox_model import OutboxEvent, enqueue_outbox_event
+from app.interfaces.api.deps import CurrentUser, Settings, TenantContext, get_current_user, get_db, get_settings, get_tenant_context
 from app.interfaces.api.schemas.documents import DocumentOut, ProcessDocumentResponse, UploadDocumentResponse
+from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
+from app.infrastructure.audit.audit_logger import AuditEvent, AuditLogger
 
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
 
-_ADMIN_ROLES = {"owner", "admin"}
 _TERMINAL_DOC_STATUSES = {"deleted"}
+_authz = AuthorizationPolicy()
 
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
@@ -40,20 +45,23 @@ def _can_access_document(*, tenant: TenantContext, doc: DocumentModel) -> bool:
         return False
     if doc.status in _TERMINAL_DOC_STATUSES:
         return False
-    if (tenant.role or "") in _ADMIN_ROLES:
-        return True
-    return bool(tenant.user_id) and (doc.uploaded_by_user_id == tenant.user_id)
+    return _authz.can_access_document(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        ),
+        uploaded_by_user_id=doc.uploaded_by_user_id,
+    )
 
 
 @router.get("/mine")
 def list_my_documents_grouped_by_organization(
     db: Session = Depends(get_db),
-    user: UserContext = Depends(get_user_context),
+    user: CurrentUser = Depends(get_current_user),
 ) -> dict:
     """Retourne tous les documents uploadés par l'utilisateur, regroupés par organisation.
 
     L'utilisateur ne voit que:
-    - les documents où `uploaded_by_user_id == X-User-Id`
+    - les documents où `uploaded_by_user_id == user`
     - et uniquement dans les organisations où il a une membership active.
     """
     rows = (
@@ -90,9 +98,11 @@ def list_documents(
     q = q.filter(DocumentModel.status != "deleted")
     if not include_archived:
         q = q.filter(DocumentModel.status != "archived")
-    if (tenant.role or "") not in _ADMIN_ROLES:
-        if not tenant.user_id:
-            raise HTTPException(status_code=400, detail="Missing X-User-Id header")
+    if not _authz.is_admin(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
         q = q.filter(DocumentModel.uploaded_by_user_id == tenant.user_id)
     items = q.order_by(DocumentModel.created_at.desc()).limit(200).all()
     return [DocumentOut.model_validate(d, from_attributes=True) for d in items]
@@ -126,6 +136,14 @@ def archive_document(
         raise HTTPException(status_code=404, detail="Document not found")
     doc.status = "archived"
     db.add(doc)
+    db.add(
+        JobModel(
+            type="INDEX",
+            status="queued",
+            organization_id=tenant.organization_id,
+            document_id=doc.id,
+        )
+    )
     db.commit()
     db.refresh(doc)
     return DocumentOut.model_validate(doc, from_attributes=True)
@@ -144,6 +162,14 @@ def unarchive_document(
         # In MVP, we don't track previous status; restore to processed.
         doc.status = "processed"
     db.add(doc)
+    db.add(
+        JobModel(
+            type="INDEX",
+            status="queued",
+            organization_id=tenant.organization_id,
+            document_id=doc.id,
+        )
+    )
     db.commit()
     db.refresh(doc)
     return DocumentOut.model_validate(doc, from_attributes=True)
@@ -160,6 +186,14 @@ def delete_document(
         raise HTTPException(status_code=404, detail="Document not found")
     doc.status = "deleted"
     db.add(doc)
+    db.add(
+        JobModel(
+            type="INDEX",
+            status="queued",
+            organization_id=tenant.organization_id,
+            document_id=doc.id,
+        )
+    )
     db.commit()
     return {"status": "deleted", "document_id": doc.id}
 
@@ -226,7 +260,7 @@ def _background_ocr_and_index(
                         document_id=doc.id,
                         organization_id=doc.organization_id,
                         uploaded_by_user_id=doc.uploaded_by_user_id,
-                        status=doc.status,
+                        status="indexed",
                         filename=doc.filename,
                         content=cleaned,
                         created_at_iso=doc.created_at.isoformat(),
@@ -298,6 +332,18 @@ def upload_document(
     db.commit()
     db.refresh(doc)
 
+    db.add(
+        DocumentVersionModel(
+            document_id=doc.id,
+            organization_id=tenant.organization_id,
+            version=1,
+            filename=doc.filename,
+            storage_key=doc.storage_key,
+            uploaded_by_user_id=tenant.user_id,
+        )
+    )
+    db.commit()
+
     # Enqueue OCR job right away (worker will process asynchronously).
     db.add(
         JobModel(
@@ -308,8 +354,111 @@ def upload_document(
         )
     )
     db.commit()
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=tenant.organization_id,
+            actor_user_id=tenant.user_id,
+            action="DOCUMENT_UPLOAD",
+            target_type="document",
+            target_id=doc.id,
+            detail={"filename": doc.filename, "status": doc.status},
+        )
+    )
+    enqueue_outbox_event(
+        db=db,
+        ev=OutboxEvent(
+            organization_id=tenant.organization_id,
+            event_type="DOCUMENT_UPLOADED",
+            payload={"document_id": doc.id, "uploaded_by_user_id": tenant.user_id, "filename": doc.filename},
+        ),
+    )
+    db.commit()
 
     return UploadDocumentResponse(document=DocumentOut.model_validate(doc, from_attributes=True))
+
+
+@router.post("/{document_id}/versions", response_model=DocumentOut)
+def add_document_version(
+    document_id: str,
+    file: UploadFile,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    tenant: TenantContext = Depends(_get_tenant),
+) -> DocumentOut:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+    doc = db.get(DocumentModel, document_id)
+    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    storage = _get_storage(settings)
+    storage_key = storage.save_upload(file)
+
+    next_version = int(
+        db.execute(
+            select(func.coalesce(func.max(DocumentVersionModel.version), 0)).where(
+                DocumentVersionModel.document_id == document_id
+            )
+        ).scalar_one()
+        + 1
+    )
+
+    db.add(
+        DocumentVersionModel(
+            document_id=doc.id,
+            organization_id=doc.organization_id,
+            version=next_version,
+            filename=file.filename,
+            storage_key=storage_key,
+            uploaded_by_user_id=tenant.user_id,
+        )
+    )
+
+    doc.filename = file.filename
+    doc.storage_key = storage_key
+    doc.status = "uploaded"
+    doc.failed_reason = None
+    db.add(doc)
+
+    # Reset content so search reflects the active version after OCR.
+    content = db.get(DocumentContentModel, doc.id)
+    if content is not None:
+        content.raw_text = None
+        content.cleaned_text = None
+        content.ocr_engine = None
+        content.language = None
+        db.add(content)
+
+    db.add(
+        JobModel(
+            type="OCR",
+            status="queued",
+            organization_id=tenant.organization_id,
+            document_id=doc.id,
+        )
+    )
+
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=tenant.organization_id,
+            actor_user_id=tenant.user_id,
+            action="DOCUMENT_VERSION_ADD",
+            target_type="document",
+            target_id=doc.id,
+            detail={"version": next_version, "filename": file.filename},
+        )
+    )
+    enqueue_outbox_event(
+        db=db,
+        ev=OutboxEvent(
+            organization_id=tenant.organization_id,
+            event_type="DOCUMENT_VERSION_ADDED",
+            payload={"document_id": doc.id, "version": next_version, "filename": file.filename},
+        ),
+    )
+    db.commit()
+    db.refresh(doc)
+    return DocumentOut.model_validate(doc, from_attributes=True)
 
 
 @router.post("/{document_id}/reindex")
@@ -382,7 +531,7 @@ def process_document(
                 document_id=doc.id,
                 organization_id=doc.organization_id,
                 uploaded_by_user_id=doc.uploaded_by_user_id,
-                status=doc.status,
+                status="indexed",
                 filename=doc.filename,
                 content=cleaned_text,
                 created_at_iso=doc.created_at.isoformat(),
@@ -538,6 +687,18 @@ def download_document_file(
 
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not found in storage")
+
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=tenant.organization_id,
+            actor_user_id=tenant.user_id,
+            action="DOCUMENT_DOWNLOAD",
+            target_type="document",
+            target_id=doc.id,
+            detail={"filename": doc.filename},
+        )
+    )
+    db.commit()
 
     return FileResponse(
         path=str(path),

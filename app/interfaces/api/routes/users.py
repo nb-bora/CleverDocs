@@ -17,11 +17,12 @@ from app.infrastructure.db.orm.models.membership_model import MembershipModel
 from app.infrastructure.db.orm.models.user_model import UserModel
 from app.interfaces.api.deps import TenantContext, get_db, get_tenant_context
 from app.interfaces.api.schemas.users import CreateUserRequest, UpdateUserRequest, UserOut
+from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
 
 
 router = APIRouter(prefix="/v1/users", tags=["users"])
 
-_ADMIN_ROLES = {"owner", "admin"}
+_authz = AuthorizationPolicy()
 
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
@@ -29,7 +30,11 @@ def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantCo
 
 
 def _require_admin(tenant: TenantContext) -> None:
-    if (tenant.role or "") not in _ADMIN_ROLES:
+    if not _authz.is_admin(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
         raise HTTPException(status_code=403, detail="ADMIN_REQUIRED")
 
 

@@ -1276,7 +1276,7 @@ docker compose up --build
 ```
 
 ### 🗃️ Migrations DB (Alembic)
-> Le squelette Alembic est présent (`alembic/`). Les premières migrations arriveront quand les modèles ORM seront implémentés.
+Alembic est **opérationnel** et contient une migration initiale complète.
 
 Créer une migration :
 
@@ -1290,14 +1290,28 @@ Appliquer les migrations :
 alembic upgrade head
 ```
 
+### 🔐 Auth (JWT)
+- Les routes API sont protégées via `Authorization: Bearer <access_token>`.
+- L’organisation active peut être sélectionnée via `X-Org-Id` mais elle est **vérifiée** contre les memberships.
+- Endpoints:
+  - `POST /v1/auth/login`
+  - `POST /v1/auth/refresh`
+  - `POST /v1/auth/logout`
+  - `GET /v1/auth/me`
+
+### 🧪 Bootstrap (dev seulement)
+`POST /v1/bootstrap` est **désactivé** hors `APP_ENV=dev` (403 `BOOTSTRAP_DISABLED`).
+
 ### 🔧 Variables d’environnement (résumé)
 - **DB** : `DATABASE_URL`
 - **Search** : `OPENSEARCH_URL`, `OPENSEARCH_INDEX_PREFIX`
 - **Storage** : `STORAGE_BACKEND`, `LOCAL_STORAGE_DIR`
 - **OCR** : `OCR_LANGS`, `OCR_GPU`
 
-## 📌 Statut du dépôt
-Ce dépôt contient actuellement la **documentation de cadrage**.
-La prochaine étape est d’implémenter le squelette `app/` et le flux minimal :
-**Upload → DocumentUploaded → OCR → DocumentProcessed → Projection → Search**.
+## 📌 Statut du dépôt (état réel)
+Le dépôt contient un MVP fonctionnel:
+- Auth JWT (access+refresh)
+- Multi-tenant via organizations + memberships (rôles owner/admin/member/reader)
+- Upload + workers OCR/Index + recherche (OpenSearch si dispo, fallback FTS/LIKE)
+- Migrations Alembic (schéma initial)
 

@@ -17,12 +17,16 @@ from sqlalchemy.orm import Session
 from app.infrastructure.db.orm.models.membership_model import MembershipModel
 from app.infrastructure.db.orm.models.organization_model import OrganizationModel
 from app.infrastructure.db.orm.models.user_model import UserModel
-from app.interfaces.api.deps import TenantContext, UserContext, get_db, get_tenant_context, get_user_context
+from app.interfaces.api.deps import CurrentUser, TenantContext, get_current_user, get_db, get_tenant_context
+from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
+from app.infrastructure.audit.audit_logger import AuditEvent, AuditLogger
+from app.infrastructure.messaging.outbox.outbox_model import OutboxEvent, enqueue_outbox_event
 
 
 router = APIRouter(prefix="/v1/organizations", tags=["organizations"])
 
-_ADMIN_ROLES = {"owner", "admin"}
+_authz = AuthorizationPolicy()
+_VALID_ROLES = {"owner", "admin", "member", "reader"}
 
 
 class OrganizationOut(BaseModel):
@@ -56,20 +60,47 @@ class UpdateMemberRequest(BaseModel):
     role: str | None = Field(default=None, min_length=1, max_length=32)
     status: str | None = Field(default=None, min_length=1, max_length=32)
 
+class TransferOwnershipRequest(BaseModel):
+    new_owner_user_id: str = Field(min_length=1, max_length=36)
+
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
     return tenant
 
 
 def _require_admin(tenant: TenantContext) -> None:
-    if (tenant.role or "") not in _ADMIN_ROLES:
+    if not _authz.is_admin(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
         raise HTTPException(status_code=403, detail="ADMIN_REQUIRED")
+
+
+def _require_owner(tenant: TenantContext) -> None:
+    if not _authz.is_owner(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
+        raise HTTPException(status_code=403, detail="OWNER_REQUIRED")
+
+
+def _get_active_owner_membership(db: Session, organization_id: str) -> MembershipModel | None:
+    return db.execute(
+        select(MembershipModel)
+        .where(MembershipModel.organization_id == organization_id)
+        .where(MembershipModel.role == "owner")
+        .where(MembershipModel.status == "active")
+        .order_by(MembershipModel.created_at.asc())
+        .limit(1)
+    ).scalar_one_or_none()
 
 
 @router.get("", response_model=list[OrganizationOut])
 def list_my_organizations(
     db: Annotated[Session, Depends(get_db)],
-    user: Annotated[UserContext, Depends(get_user_context)],
+    user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> list[OrganizationOut]:
     stmt = (
         select(OrganizationModel)
@@ -86,9 +117,9 @@ def list_my_organizations(
 def create_organization(
     body: CreateOrganizationRequest,
     db: Annotated[Session, Depends(get_db)],
-    user: Annotated[UserContext, Depends(get_user_context)],
+    user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> OrganizationOut:
-    org = OrganizationModel(id=str(uuid.uuid4()), name=body.name, status="active")
+    org = OrganizationModel(id=str(uuid.uuid4()), name=body.name, owner_user_id=user.user_id, status="active")
     db.add(org)
     db.add(
         MembershipModel(
@@ -101,6 +132,25 @@ def create_organization(
     )
     db.commit()
     db.refresh(org)
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=org.id,
+            actor_user_id=user.user_id,
+            action="ORG_CREATE",
+            target_type="organization",
+            target_id=org.id,
+            detail={"name": org.name},
+        )
+    )
+    enqueue_outbox_event(
+        db=db,
+        ev=OutboxEvent(
+            organization_id=org.id,
+            event_type="ORG_CREATED",
+            payload={"organization_id": org.id, "owner_user_id": user.user_id, "name": org.name},
+        ),
+    )
+    db.commit()
     return OrganizationOut.model_validate(org, from_attributes=True)
 
 
@@ -185,10 +235,12 @@ def delete_organization(
 ) -> dict:
     if tenant.organization_id != organization_id:
         raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
-    _require_admin(tenant)
+    _require_owner(tenant)
     org = db.get(OrganizationModel, organization_id)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
+    if org.owner_user_id != tenant.user_id:
+        raise HTTPException(status_code=403, detail="OWNER_REQUIRED")
     # Soft delete in MVP: mark suspended.
     org.status = "suspended"
     db.add(org)
@@ -243,6 +295,10 @@ def add_member(
         .where(MembershipModel.user_id == user.id)
     ).scalar_one_or_none()
     if existing is not None:
+        if existing.role == "owner":
+            raise HTTPException(status_code=409, detail="OWNER_MEMBERSHIP_IMMUTABLE")
+        if body.role not in _VALID_ROLES or body.role == "owner":
+            raise HTTPException(status_code=400, detail="INVALID_ROLE")
         existing.role = body.role
         existing.status = "active"
         db.add(existing)
@@ -254,12 +310,23 @@ def add_member(
         id=str(uuid.uuid4()),
         user_id=user.id,
         organization_id=organization_id,
-        role=body.role,
+        role=("member" if body.role not in _VALID_ROLES or body.role == "owner" else body.role),
         status="active",
     )
     db.add(membership)
     db.commit()
     db.refresh(membership)
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=organization_id,
+            actor_user_id=tenant.user_id,
+            action="MEMBER_ADD",
+            target_type="membership",
+            target_id=membership.id,
+            detail={"user_id": membership.user_id, "role": membership.role},
+        )
+    )
+    db.commit()
     return MembershipOut.model_validate(membership, from_attributes=True)
 
 
@@ -277,13 +344,28 @@ def update_member(
     m = db.get(MembershipModel, membership_id)
     if m is None or m.organization_id != organization_id:
         raise HTTPException(status_code=404, detail="Membership not found")
+    if m.role == "owner":
+        raise HTTPException(status_code=409, detail="OWNER_MEMBERSHIP_IMMUTABLE")
     if body.role is not None:
+        if body.role not in _VALID_ROLES or body.role == "owner":
+            raise HTTPException(status_code=400, detail="INVALID_ROLE")
         m.role = body.role
     if body.status is not None:
         m.status = body.status
     db.add(m)
     db.commit()
     db.refresh(m)
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=organization_id,
+            actor_user_id=tenant.user_id,
+            action="MEMBER_UPDATE",
+            target_type="membership",
+            target_id=m.id,
+            detail={"role": m.role, "status": m.status},
+        )
+    )
+    db.commit()
     return MembershipOut.model_validate(m, from_attributes=True)
 
 
@@ -300,6 +382,8 @@ def suspend_member(
     m = db.get(MembershipModel, membership_id)
     if m is None or m.organization_id != organization_id:
         raise HTTPException(status_code=404, detail="Membership not found")
+    if m.role == "owner":
+        raise HTTPException(status_code=409, detail="OWNER_MEMBERSHIP_IMMUTABLE")
     m.status = "suspended"
     db.add(m)
     db.commit()
@@ -340,8 +424,68 @@ def remove_member(
     m = db.get(MembershipModel, membership_id)
     if m is None or m.organization_id != organization_id:
         raise HTTPException(status_code=404, detail="Membership not found")
+    if m.role == "owner":
+        raise HTTPException(status_code=409, detail="OWNER_MEMBERSHIP_IMMUTABLE")
     # Soft delete for MVP: set a terminal status.
     m.status = "removed"
     db.add(m)
     db.commit()
     return {"status": "removed", "membership_id": m.id}
+
+
+@router.post("/{organization_id}/transfer_ownership")
+def transfer_ownership(
+    organization_id: str,
+    body: TransferOwnershipRequest,
+    db: Annotated[Session, Depends(get_db)],
+    tenant: Annotated[TenantContext, Depends(_get_tenant)],
+) -> dict:
+    if tenant.organization_id != organization_id:
+        raise HTTPException(status_code=403, detail="CROSS_TENANT_FORBIDDEN")
+    _require_owner(tenant)
+
+    org = db.get(OrganizationModel, organization_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if org.owner_user_id != tenant.user_id:
+        raise HTTPException(status_code=403, detail="OWNER_REQUIRED")
+
+    new_owner = db.execute(
+        select(MembershipModel)
+        .where(MembershipModel.organization_id == organization_id)
+        .where(MembershipModel.user_id == body.new_owner_user_id)
+        .where(MembershipModel.status == "active")
+        .limit(1)
+    ).scalar_one_or_none()
+    if new_owner is None:
+        raise HTTPException(status_code=404, detail="New owner must be an active member")
+    if new_owner.role == "owner":
+        return {"status": "ok", "organization_id": organization_id, "new_owner_user_id": new_owner.user_id}
+
+    # Transfer: promote new owner, demote old owner to admin.
+    new_owner.role = "owner"
+    org.owner_user_id = new_owner.user_id
+    # Demote old owner membership (if exists) to admin.
+    old_owner_m = _get_active_owner_membership(db, organization_id)
+    if old_owner_m is not None and old_owner_m.user_id != new_owner.user_id:
+        old_owner_m.role = "admin"
+        db.add(old_owner_m)
+    db.add_all([new_owner, org])
+    db.commit()
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=organization_id,
+            actor_user_id=tenant.user_id,
+            action="ORG_TRANSFER_OWNERSHIP",
+            target_type="organization",
+            target_id=organization_id,
+            detail={"new_owner_user_id": new_owner.user_id},
+        )
+    )
+    db.commit()
+    return {
+        "status": "ok",
+        "organization_id": organization_id,
+        "old_owner_user_id": tenant.user_id,
+        "new_owner_user_id": new_owner.user_id,
+    }

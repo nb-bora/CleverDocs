@@ -12,17 +12,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, text as sql_text
 from sqlalchemy.orm import Session
 
+from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel
 from app.infrastructure.db.orm.models.document_model import DocumentModel
 from app.infrastructure.db.orm.models.membership_model import MembershipModel
 from app.infrastructure.search.search_engine_impl import SearchEngineImpl, SearchEngineSettings
-from app.interfaces.api.deps import Settings, TenantContext, UserContext, get_db, get_settings, get_tenant_context, get_user_context
+from app.interfaces.api.deps import CurrentUser, Settings, TenantContext, get_current_user, get_db, get_settings, get_tenant_context
 from app.interfaces.api.schemas.search import SearchResponse, SearchResultItem
+from app.infrastructure.audit.audit_logger import AuditEvent, AuditLogger
 
 
 router = APIRouter(prefix="/v1/search", tags=["search"])
 
-_ADMIN_ROLES = {"owner", "admin"}
+_authz = AuthorizationPolicy()
 
 
 def _get_tenant(tenant: TenantContext = Depends(get_tenant_context)) -> TenantContext:
@@ -41,12 +43,25 @@ def search_documents(
         raise HTTPException(status_code=400, detail="Empty query")
 
     restrict_to_user_id: str | None = None
-    if (tenant.role or "") not in _ADMIN_ROLES:
-        if not tenant.user_id:
-            raise HTTPException(status_code=400, detail="Missing X-User-Id header")
+    if not _authz.is_admin(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
         restrict_to_user_id = tenant.user_id
 
     include_archived = False
+    AuditLogger(db).log(
+        AuditEvent(
+            organization_id=tenant.organization_id,
+            actor_user_id=tenant.user_id,
+            action="SEARCH_QUERY",
+            target_type=None,
+            target_id=None,
+            detail={"q": query, "include_archived": include_archived},
+        )
+    )
+    db.commit()
 
     # Prefer OpenSearch if reachable; fallback to SQL/FTS below.
     try:
@@ -172,7 +187,7 @@ def search_my_documents_across_orgs(
     q: Annotated[str, Query(min_length=1, max_length=200)],
     db: Annotated[Session, Depends(get_db)],
     settings: Annotated[Settings, Depends(get_settings)],
-    user: Annotated[UserContext, Depends(get_user_context)],
+    user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> SearchResponse:
     """Recherche "mes documents" sur toutes mes organisations.
 
