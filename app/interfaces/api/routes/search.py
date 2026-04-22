@@ -109,17 +109,17 @@ def search_documents(
             sql_text(
                 """
                 SELECT
-                  f.document_id,
-                  f.filename,
-                  bm25(f) AS bm25_score,
-                  snippet(f, 2, '[', ']', '…', 12) AS snip
-                FROM document_search_fts f
-                JOIN documents d ON d.id = f.document_id
-                WHERE f.organization_id = :org_id
+                  document_id,
+                  filename,
+                  bm25(document_search_fts) AS bm25_score,
+                  snippet(document_search_fts, 2, '[', ']', '…', 12) AS snip
+                FROM document_search_fts
+                JOIN documents d ON d.id = document_id
+                WHERE organization_id = :org_id
                   AND (:user_id IS NULL OR d.uploaded_by_user_id = :user_id)
                   AND d.status != 'deleted'
                   AND (:include_archived = 1 OR d.status != 'archived')
-                  AND f MATCH :q
+                  AND document_search_fts MATCH :q
                 ORDER BY bm25_score ASC
                 LIMIT 25
                 """
@@ -257,19 +257,19 @@ def search_my_documents_across_orgs(
             sql_text(
                 """
                 SELECT
-                  f.document_id,
-                  f.filename,
-                  bm25(f) AS bm25_score,
-                  snippet(f, 2, '[', ']', '…', 12) AS snip
-                FROM document_search_fts f
-                JOIN documents d ON d.id = f.document_id
-                JOIN memberships m ON m.organization_id = f.organization_id
+                  document_id,
+                  filename,
+                  bm25(document_search_fts) AS bm25_score,
+                  snippet(document_search_fts, 2, '[', ']', '…', 12) AS snip
+                FROM document_search_fts
+                JOIN documents d ON d.id = document_id
+                JOIN memberships m ON m.organization_id = organization_id
                 WHERE m.user_id = :user_id
                   AND m.status = 'active'
                   AND d.uploaded_by_user_id = :user_id
                   AND d.status != 'deleted'
                   AND d.status != 'archived'
-                  AND f MATCH :q
+                  AND document_search_fts MATCH :q
                 ORDER BY bm25_score ASC
                 LIMIT 25
                 """

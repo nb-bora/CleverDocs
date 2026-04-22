@@ -125,6 +125,10 @@ def _hash_refresh_token(token: str) -> str:
     # SHA-256 hex is enough here (token itself is high-entropy random).
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+def _ensure_utc(dt: datetime) -> datetime:
+    # SQLite often returns naive datetimes even when timezone=True.
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
 
 def issue_refresh_token(*, settings: Settings, db: Session, user_id: str) -> str:
     raw = secrets.token_urlsafe(48)
@@ -150,7 +154,7 @@ def rotate_refresh_token(*, settings: Settings, db: Session, raw_refresh_token: 
         raise HTTPException(status_code=401, detail="Invalid refresh token")
     if rt.revoked_at is not None:
         raise HTTPException(status_code=401, detail="Refresh token revoked")
-    if rt.expires_at <= _now():
+    if _ensure_utc(rt.expires_at) <= _now():
         raise HTTPException(status_code=401, detail="Refresh token expired")
 
     rt.revoked_at = _now()
