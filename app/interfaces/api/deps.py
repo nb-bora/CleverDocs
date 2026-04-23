@@ -42,6 +42,42 @@ class Settings(BaseSettings):
     opensearch_url: str = "http://localhost:9200"
     opensearch_index_prefix: str = "cleverdocs"
 
+    # Public URL (used in notification links)
+    app_public_base_url: str = "http://127.0.0.1:5173"
+
+    # Semantic search (embeddings)
+    semantic_enabled: bool = True
+    semantic_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    semantic_chunk_chars: int = 1200
+    semantic_chunk_overlap_chars: int = 200
+    semantic_max_chunks_per_doc: int = 64
+
+    # Pipeline mode
+    processing_mode: str = "async"  # "async" | "sync"
+
+    # Email notifications (Gmail SMTP)
+    mail_enabled: bool = False
+    mail_provider: str = "gmail_smtp"
+    mail_username: str = ""
+    mail_app_password: str = ""
+    mail_from: str = ""
+    mail_from_name: str = "CleverDocs"
+    mail_reply_to: str = ""
+
+    # Invitations email anti-spam (app-level)
+    invitation_resend_min_interval_seconds: int = 60
+    invitation_resend_max_per_day: int = 3
+    mail_debug_return_token: bool = False
+
+    # RAG / QA (LLM optional, OpenAI-compatible)
+    rag_enabled: bool = False
+    rag_model: str = "gpt-4o-mini"
+    rag_api_base_url: str = "https://api.openai.com"
+    rag_api_key: str = ""
+    rag_max_sources: int = 8
+    rag_min_best_chunk_score: float = 0.35
+    rag_answer_max_tokens: int = 450
+
     # OCR (EasyOCR)
     ocr_langs: str = "fr"  # comma-separated (e.g. "fr,en")
     ocr_gpu: bool = False

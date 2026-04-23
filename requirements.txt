@@ -10,6 +10,10 @@ httpx
 passlib[bcrypt]
 python-jose[cryptography]
 
+# semantic search (optional but recommended)
+numpy
+sentence-transformers
+
 # dev
 ruff
 pytest

@@ -8,6 +8,7 @@ from pydantic import BaseModel, EmailStr, Field
 class UserOut(BaseModel):
     id: str
     email: EmailStr
+    username: str | None = None
     display_name: str | None = None
     avatar_storage_key: str | None = None
     status: str
@@ -20,6 +21,7 @@ class CreateUserRequest(BaseModel):
 
 class UpdateUserRequest(BaseModel):
     email: EmailStr | None = None
+    username: str | None = Field(default=None, max_length=39)
     display_name: str | None = Field(default=None, max_length=255)
 
 

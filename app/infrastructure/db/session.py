@@ -78,6 +78,38 @@ def ensure_sqlite_fts() -> None:
             )
 
 
+def ensure_sqlite_semantic_schema() -> None:
+    """Ensure SQLite schema for semantic embeddings exists in dev MVP.
+
+    We keep embeddings in a normal table (not FTS) for portability.
+    """
+    url = str(ENGINE.url)
+    if not url.startswith("sqlite"):
+        return
+
+    with ENGINE.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS document_embeddings (
+                  id VARCHAR(36) PRIMARY KEY,
+                  organization_id VARCHAR(36) NOT NULL,
+                  document_id VARCHAR(36) NOT NULL,
+                  chunk_index INTEGER NOT NULL,
+                  chunk_text TEXT NOT NULL,
+                  embedding_json TEXT NOT NULL,
+                  model_name VARCHAR(255) NOT NULL,
+                  created_at DATETIME,
+                  updated_at DATETIME,
+                  CONSTRAINT uq_document_embedding_doc_chunk UNIQUE(document_id, chunk_index)
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_embeddings_organization_id ON document_embeddings(organization_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_embeddings_document_id ON document_embeddings(document_id)"))
+
+
 def ensure_sqlite_jobs_schema() -> None:
     """Evolve SQLite schema for `jobs` table in MVP without Alembic.
 
@@ -127,6 +159,13 @@ def ensure_sqlite_identity_schema() -> None:
             user_col_names = {c[1] for c in user_cols}
             if "password_hash" not in user_col_names:
                 conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255)"))
+            if "username" not in user_col_names:
+                conn.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(39)"))
+                # Best-effort unique index for dev.
+                try:
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users(username)"))
+                except Exception:
+                    ...
 
         # Refresh tokens table (new in auth phase)
         conn.execute(

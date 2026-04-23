@@ -111,9 +111,11 @@ def me(
     u = db.get(UserModel, current_user.user_id)
     avatar = getattr(u, "avatar_storage_key", None) if u is not None else None
     display_name = getattr(u, "display_name", None) if u is not None else None
+    username = getattr(u, "username", None) if u is not None else None
     return {
         "user_id": current_user.user_id,
         "email": current_user.email,
+        "username": username,
         "display_name": display_name,
         "avatar_storage_key": avatar,
     }
@@ -132,8 +134,10 @@ def change_password(
         raise HTTPException(status_code=403, detail="User disabled")
     if not user.password_hash:
         raise HTTPException(status_code=409, detail="PASSWORD_NOT_SET")
+    if body.current_password == body.new_password:
+        raise HTTPException(status_code=400, detail="PASSWORD_SAME_AS_CURRENT")
     if not pwd_context.verify(body.current_password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(status_code=401, detail="CURRENT_PASSWORD_INCORRECT")
 
     user.password_hash = pwd_context.hash(body.new_password)
     db.add(user)

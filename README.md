@@ -1113,7 +1113,7 @@ Objectif : **ne jamais coder “trop large”**. Chaque micro-phase a une **sort
 - **0.1 — Conventions** : conventions (naming, erreurs, statuts, permissions) formalisées
   - **Sortie** : section “conventions” validée dans ce README
 - **0.2 — Service vivant** : FastAPI minimal
-  - **Sortie** : `GET /health` → `200 OK`
+  - **Sortie** : le service démarre et expose les routes API
 - **0.3 — Config & logs** : variables d’environnement + logging lisible
   - **Sortie** : le service démarre avec config env + logs cohérents
 
@@ -1122,15 +1122,15 @@ Objectif : **ne jamais coder “trop large”**. Chaque micro-phase a une **sort
   - **Sortie** : table `documents` (id, filename, status=uploaded, created_at, storage_key)
 - **1.2 — Upload + stockage local**
   - **Sortie** : `POST /v1/documents` crée un document + stocke le fichier
-- **1.3 — Lecture document**
-  - **Sortie** : `GET /v1/documents/{id}` retourne `status=uploaded`
+- **1.3 — Lecture documents**
+  - **Sortie** : `GET /v1/documents` retourne la liste (dont le document uploadé)
 
 #### 🧠 Phase 2 — OCR synchrone (temporaire) pour prouver la valeur
 > Cette phase est volontairement “moins scalable”, juste pour valider le flux rapidement.
 - **2.1 — OCR inline sur un fichier image**
   - **Sortie** : extraction d’un texte (même basique) sur un exemple réel
 - **2.2 — Persistance du texte**
-  - **Sortie** : table `document_contents` + `GET /v1/documents/{id}` expose un `text_preview`
+  - **Sortie** : table `document_contents` et la recherche renvoie un extrait (`preview`)
 
 #### ⚙️ Phase 3 — Asynchrone réel (worker OCR) + statuts
 - **3.1 — Job OCR à la création**
@@ -1263,7 +1263,7 @@ uvicorn app.interfaces.api.main:app --reload
 ```
 
 6. Vérifier
-- `GET /health` → `{"status":"ok"}`
+- `POST /v1/auth/login` puis `GET /v1/auth/me`
 
 ### 🐳 Lancement avec Docker (recommandé)
 Cela démarre :
@@ -1298,9 +1298,6 @@ alembic upgrade head
   - `POST /v1/auth/refresh`
   - `POST /v1/auth/logout`
   - `GET /v1/auth/me`
-
-### 🧪 Bootstrap (dev seulement)
-`POST /v1/bootstrap` est **désactivé** hors `APP_ENV=dev` (403 `BOOTSTRAP_DISABLED`).
 
 ### 🔧 Variables d’environnement (résumé)
 - **DB** : `DATABASE_URL`

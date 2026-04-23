@@ -1,1 +1,0 @@
-"""Organization aggregate/entity (tenant)."""

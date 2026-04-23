@@ -7,24 +7,26 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
+from typing import Annotated, Literal
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.infrastructure.db.orm.models.document_content_model import DocumentContentModel
 from app.infrastructure.db.orm.models.document_model import DocumentModel
 from app.infrastructure.db.orm.models.document_version_model import DocumentVersionModel
 from app.infrastructure.db.orm.models.job_model import JobModel
-from app.infrastructure.db.orm.models.membership_model import MembershipModel
 from app.infrastructure.db.fts import upsert_sqlite_fts
+from app.infrastructure.search.semantic_search import SemanticSettings, upsert_document_embeddings
 from app.infrastructure.ocr.easyocr_adapter import EasyOcrNotInstalled
 from app.infrastructure.ocr.ocr_service_impl import OcrConfig, OcrServiceImpl, PdfOcrNotInstalled
 from app.infrastructure.db.session import SessionLocal
 from app.infrastructure.search.search_engine_impl import SearchEngineImpl, SearchEngineSettings
 from app.infrastructure.storage.local_file_storage import LocalFileStorage
 from app.infrastructure.messaging.outbox.outbox_model import OutboxEvent, enqueue_outbox_event
-from app.interfaces.api.deps import CurrentUser, Settings, TenantContext, get_current_user, get_db, get_settings, get_tenant_context
+from app.interfaces.api.deps import Settings, TenantContext, get_db, get_settings, get_tenant_context
 from app.interfaces.api.schemas.documents import DocumentOut, ProcessDocumentResponse, UploadDocumentResponse
 from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
 from app.infrastructure.audit.audit_logger import AuditEvent, AuditLogger
@@ -52,40 +54,13 @@ def _can_access_document(*, tenant: TenantContext, doc: DocumentModel) -> bool:
         uploaded_by_user_id=doc.uploaded_by_user_id,
     )
 
-
-@router.get("/mine")
-def list_my_documents_grouped_by_organization(
-    db: Session = Depends(get_db),
-    user: CurrentUser = Depends(get_current_user),
-) -> dict:
-    """Retourne tous les documents uploadés par l'utilisateur, regroupés par organisation.
-
-    L'utilisateur ne voit que:
-    - les documents où `uploaded_by_user_id == user`
-    - et uniquement dans les organisations où il a une membership active.
-    """
-    rows = (
-        db.query(DocumentModel)
-        .join(MembershipModel, MembershipModel.organization_id == DocumentModel.organization_id)
-        .filter(MembershipModel.user_id == user.user_id)
-        .filter(MembershipModel.status == "active")
-        .filter(DocumentModel.uploaded_by_user_id == user.user_id)
-        .filter(DocumentModel.status != "deleted")
-        .order_by(DocumentModel.organization_id.asc(), DocumentModel.created_at.desc())
-        .all()
-    )
-
-    grouped: dict[str, list[DocumentOut]] = {}
-    for doc in rows:
-        org_id = doc.organization_id or "unknown"
-        grouped.setdefault(org_id, []).append(DocumentOut.model_validate(doc, from_attributes=True))
-
-    return {
-        "user_id": user.user_id,
-        "organizations": [
-            {"organization_id": org_id, "documents": docs} for org_id, docs in grouped.items()
-        ],
-    }
+def _require_can_upload(tenant: TenantContext) -> None:
+    if not _authz.can_upload(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
+        raise HTTPException(status_code=403, detail="UPLOAD_NOT_ALLOWED")
 
 
 @router.get("", response_model=list[DocumentOut])
@@ -93,36 +68,43 @@ def list_documents(
     db: Session = Depends(get_db),
     tenant: TenantContext = Depends(_get_tenant),
     include_archived: bool = False,
+    query: Annotated[str | None, Query(max_length=200, alias="q")] = None,
+    status: Annotated[
+        Literal["uploaded", "processing", "processed", "indexed", "archived", "failed", "indexing_failed", "indexing_pending"] | None,
+        Query(),
+    ] = None,
+    sort: Annotated[Literal["created_desc", "updated_desc", "name_asc"], Query()] = "created_desc",
+    limit: Annotated[int, Query(ge=1, le=200)] = 200,
 ) -> list[DocumentOut]:
+    if not _authz.can_read(
+        DomainTenantContext(
+            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
+        )
+    ):
+        raise HTTPException(status_code=403, detail="READ_NOT_ALLOWED")
     q = db.query(DocumentModel).filter(DocumentModel.organization_id == tenant.organization_id)
     q = q.filter(DocumentModel.status != "deleted")
     if not include_archived:
         q = q.filter(DocumentModel.status != "archived")
+    if status is not None:
+        q = q.filter(DocumentModel.status == status)
+    if query is not None and query.strip():
+        needle = f"%{query.strip()}%"
+        q = q.filter(DocumentModel.filename.ilike(needle))
     if not _authz.is_admin(
         DomainTenantContext(
             organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
         )
     ):
         q = q.filter(DocumentModel.uploaded_by_user_id == tenant.user_id)
-    items = q.order_by(DocumentModel.created_at.desc()).limit(200).all()
+    if sort == "updated_desc":
+        q = q.order_by(DocumentModel.updated_at.desc())
+    elif sort == "name_asc":
+        q = q.order_by(DocumentModel.filename.asc())
+    else:
+        q = q.order_by(DocumentModel.created_at.desc())
+    items = q.limit(limit).all()
     return [DocumentOut.model_validate(d, from_attributes=True) for d in items]
-
-
-@router.patch("/{document_id}", response_model=DocumentOut)
-def update_document(
-    document_id: str,
-    filename: str,
-    db: Session = Depends(get_db),
-    tenant: TenantContext = Depends(_get_tenant),
-) -> DocumentOut:
-    doc = db.get(DocumentModel, document_id)
-    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
-        raise HTTPException(status_code=404, detail="Document not found")
-    doc.filename = filename
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
-    return DocumentOut.model_validate(doc, from_attributes=True)
 
 
 @router.post("/{document_id}/archive", response_model=DocumentOut)
@@ -131,6 +113,7 @@ def archive_document(
     db: Session = Depends(get_db),
     tenant: TenantContext = Depends(_get_tenant),
 ) -> DocumentOut:
+    _require_can_upload(tenant)
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
@@ -155,6 +138,7 @@ def unarchive_document(
     db: Session = Depends(get_db),
     tenant: TenantContext = Depends(_get_tenant),
 ) -> DocumentOut:
+    _require_can_upload(tenant)
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
@@ -181,6 +165,7 @@ def delete_document(
     db: Session = Depends(get_db),
     tenant: TenantContext = Depends(_get_tenant),
 ) -> dict:
+    _require_can_upload(tenant)
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
@@ -242,6 +227,24 @@ def _background_ocr_and_index(
                 filename=doc.filename,
                 content=cleaned,
             )
+            try:
+                s = Settings()
+                if getattr(s, "semantic_enabled", True):
+                    upsert_document_embeddings(
+                        db=db,
+                        organization_id=doc.organization_id,
+                        document_id=doc.id,
+                        content=cleaned,
+                        settings=SemanticSettings(
+                            model_name=s.semantic_model_name,
+                            chunk_chars=int(s.semantic_chunk_chars),
+                            chunk_overlap_chars=int(s.semantic_chunk_overlap_chars),
+                            max_chunks_per_doc=int(s.semantic_max_chunks_per_doc),
+                        ),
+                    )
+            except Exception:
+                # Semantic indexing is best-effort in MVP (deps/model download may be missing).
+                ...
         db.commit()
 
         if cleaned:
@@ -311,6 +314,7 @@ def upload_document(
     settings: Settings = Depends(get_settings),
     tenant: TenantContext = Depends(_get_tenant),
 ) -> UploadDocumentResponse:
+    _require_can_upload(tenant)
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename")
 
@@ -374,91 +378,12 @@ def upload_document(
     )
     db.commit()
 
+    # If sync mode: process immediately (OCR/text extract + FTS + semantic embeddings + optional OpenSearch indexing).
+    if (getattr(settings, "processing_mode", "async") or "async").lower() == "sync":
+        out = process_document(document_id=doc.id, background=BackgroundTasks(), db=db, settings=settings, tenant=tenant)
+        return UploadDocumentResponse(document=out.document)
+
     return UploadDocumentResponse(document=DocumentOut.model_validate(doc, from_attributes=True))
-
-
-@router.post("/{document_id}/versions", response_model=DocumentOut)
-def add_document_version(
-    document_id: str,
-    file: UploadFile,
-    db: Session = Depends(get_db),
-    settings: Settings = Depends(get_settings),
-    tenant: TenantContext = Depends(_get_tenant),
-) -> DocumentOut:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing filename")
-    doc = db.get(DocumentModel, document_id)
-    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    storage = _get_storage(settings)
-    storage_key = storage.save_upload(file)
-
-    next_version = int(
-        db.execute(
-            select(func.coalesce(func.max(DocumentVersionModel.version), 0)).where(
-                DocumentVersionModel.document_id == document_id
-            )
-        ).scalar_one()
-        + 1
-    )
-
-    db.add(
-        DocumentVersionModel(
-            document_id=doc.id,
-            organization_id=doc.organization_id,
-            version=next_version,
-            filename=file.filename,
-            storage_key=storage_key,
-            uploaded_by_user_id=tenant.user_id,
-        )
-    )
-
-    doc.filename = file.filename
-    doc.storage_key = storage_key
-    doc.status = "uploaded"
-    doc.failed_reason = None
-    db.add(doc)
-
-    # Reset content so search reflects the active version after OCR.
-    content = db.get(DocumentContentModel, doc.id)
-    if content is not None:
-        content.raw_text = None
-        content.cleaned_text = None
-        content.ocr_engine = None
-        content.language = None
-        db.add(content)
-
-    db.add(
-        JobModel(
-            type="OCR",
-            status="queued",
-            organization_id=tenant.organization_id,
-            document_id=doc.id,
-        )
-    )
-
-    AuditLogger(db).log(
-        AuditEvent(
-            organization_id=tenant.organization_id,
-            actor_user_id=tenant.user_id,
-            action="DOCUMENT_VERSION_ADD",
-            target_type="document",
-            target_id=doc.id,
-            detail={"version": next_version, "filename": file.filename},
-        )
-    )
-    enqueue_outbox_event(
-        db=db,
-        ev=OutboxEvent(
-            organization_id=tenant.organization_id,
-            event_type="DOCUMENT_VERSION_ADDED",
-            payload={"document_id": doc.id, "version": next_version, "filename": file.filename},
-        ),
-    )
-    db.commit()
-    db.refresh(doc)
-    return DocumentOut.model_validate(doc, from_attributes=True)
 
 
 @router.post("/{document_id}/reindex")
@@ -467,6 +392,7 @@ def reindex_document(
     db: Session = Depends(get_db),
     tenant: TenantContext = Depends(_get_tenant),
 ) -> dict:
+    _require_can_upload(tenant)
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
@@ -482,23 +408,6 @@ def reindex_document(
     return {"status": "queued", "document_id": doc.id}
 
 
-@router.get("/{document_id}", response_model=DocumentOut)
-def get_document(
-    document_id: str,
-    db: Session = Depends(get_db),
-    tenant: TenantContext = Depends(_get_tenant),
-) -> DocumentOut:
-    doc = db.get(DocumentModel, document_id)
-    if doc is None or not _can_access_document(tenant=tenant, doc=doc):
-        raise HTTPException(status_code=404, detail="Document not found")
-    content = db.get(DocumentContentModel, document_id)
-    preview = None
-    if content and content.cleaned_text:
-        preview = content.cleaned_text[:500]
-    out = DocumentOut.model_validate(doc, from_attributes=True)
-    return out.model_copy(update={"text_preview": preview})
-
-
 @router.post("/{document_id}/process", response_model=ProcessDocumentResponse)
 def process_document(
     document_id: str,
@@ -507,6 +416,7 @@ def process_document(
     settings: Settings = Depends(get_settings),
     tenant: TenantContext = Depends(_get_tenant),
 ) -> ProcessDocumentResponse:
+    _require_can_upload(tenant)
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
@@ -556,6 +466,22 @@ def process_document(
                 filename=doc.filename,
                 content=cleaned_existing,
             )
+            try:
+                if getattr(settings, "semantic_enabled", True):
+                    upsert_document_embeddings(
+                        db=db,
+                        organization_id=doc.organization_id,
+                        document_id=doc.id,
+                        content=cleaned_existing,
+                        settings=SemanticSettings(
+                            model_name=settings.semantic_model_name,
+                            chunk_chars=int(settings.semantic_chunk_chars),
+                            chunk_overlap_chars=int(settings.semantic_chunk_overlap_chars),
+                            max_chunks_per_doc=int(settings.semantic_max_chunks_per_doc),
+                        ),
+                    )
+            except Exception:
+                ...
             db.commit()
         # If already indexed, just return. Otherwise try to index now.
         if doc.status != "indexed" and cleaned_existing:

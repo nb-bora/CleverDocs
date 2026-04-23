@@ -23,6 +23,7 @@ from app.infrastructure.db.orm.models.outbox_event_model import OutboxEventModel
 from app.infrastructure.db.orm.models.permission_model import PermissionModel  # noqa: F401
 from app.infrastructure.db.orm.models.role_model import RoleModel  # noqa: F401
 from app.infrastructure.db.orm.models.role_permission_model import RolePermissionModel  # noqa: F401
+from app.infrastructure.db.orm.models.document_embedding_model import DocumentEmbeddingModel  # noqa: F401
 
 config = context.config
 

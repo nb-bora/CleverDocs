@@ -16,6 +16,7 @@ class UserModel(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    username: Mapped[str | None] = mapped_column(String(39), unique=True, index=True, nullable=True)
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     avatar_storage_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)

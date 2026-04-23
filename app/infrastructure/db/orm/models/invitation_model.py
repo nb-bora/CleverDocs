@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import Boolean, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.db.orm.base import Base
@@ -24,6 +24,12 @@ class InvitationModel(Base):
 
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    declined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Link to an existing user (optional) OR a provisioned pre-user created for this invitation.
+    invited_user_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    provisioned_user_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    provisioned_user_was_created: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_by_user_id: Mapped[str] = mapped_column(String(36), index=True)
 

@@ -52,7 +52,9 @@ class MembershipOut(BaseModel):
 
 
 class AddMemberRequest(BaseModel):
-    user_email: str = Field(min_length=3, max_length=320)
+    user_email: str | None = Field(default=None, min_length=3, max_length=320)
+    user_id: str | None = Field(default=None, min_length=1, max_length=36)
+    username: str | None = Field(default=None, min_length=1, max_length=39)
     role: str = Field(default="member", min_length=1, max_length=32)
 
 
@@ -281,13 +283,29 @@ def add_member(
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
 
-    email = body.user_email.strip().lower()
-    user = db.execute(select(UserModel).where(UserModel.email == email)).scalar_one_or_none()
-    if user is None:
-        user = UserModel(id=str(uuid.uuid4()), email=email, display_name=None, status="active")
-        db.add(user)
-        db.commit()
-        db.refresh(user)
+    provided = [v for v in [body.user_email, body.user_id, body.username] if v]
+    if len(provided) != 1:
+        raise HTTPException(status_code=400, detail="IDENTITY_REQUIRED")
+
+    user: UserModel | None = None
+    if body.user_id:
+        user = db.get(UserModel, body.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+    elif body.username:
+        uname = body.username.strip()
+        user = db.execute(select(UserModel).where(UserModel.username == uname)).scalar_one_or_none()
+        if user is None:
+            raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
+    else:
+        email = body.user_email.strip().lower() if body.user_email else ""
+        user = db.execute(select(UserModel).where(UserModel.email == email)).scalar_one_or_none()
+        if user is None:
+            # Back-compat: allowing creation by email (acts like "pre-create user").
+            user = UserModel(id=str(uuid.uuid4()), email=email, display_name=None, status="active")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
 
     existing = db.execute(
         select(MembershipModel)
