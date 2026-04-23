@@ -13,6 +13,7 @@ class CreateInvitationRequest(BaseModel):
 class InvitationOut(BaseModel):
     id: str
     organization_id: str
+    organization_name: str | None = None
     email: EmailStr
     role: str
     status: str

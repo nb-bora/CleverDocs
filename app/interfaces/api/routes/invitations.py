@@ -124,6 +124,8 @@ def list_invitations(
             | (InvitationModel.provisioned_user_id == current_user.user_id)
         )
     items = db.execute(stmt).scalars().all()
+    org = db.get(OrganizationModel, tenant.organization_id)
+    org_name = getattr(org, "name", None) if org else None
 
     out: list[InvitationOut] = []
     for inv in items:
@@ -134,6 +136,7 @@ def list_invitations(
             InvitationOut(
                 id=inv.id,
                 organization_id=inv.organization_id,
+                organization_name=org_name,
                 email=inv.email,
                 role=inv.role,
                 status=st,
@@ -145,6 +148,113 @@ def list_invitations(
             )
         )
     return out
+
+
+@router.get("/received", response_model=list[InvitationOut])
+def list_received_invitations(
+    status: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
+    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)] = None,
+) -> list[InvitationOut]:
+    """List invitations received by the current user across all organizations.
+
+    This endpoint is intentionally NOT org-scoped: a user can receive invitations to orgs
+    they are not yet a member of.
+    """
+    me_email = str(current_user.email).lower()
+    stmt = (
+        select(InvitationModel, OrganizationModel.name)
+        .join(OrganizationModel, OrganizationModel.id == InvitationModel.organization_id)
+        .where(
+            (InvitationModel.email == me_email)
+            | (InvitationModel.invited_user_id == current_user.user_id)
+            | (InvitationModel.provisioned_user_id == current_user.user_id)
+        )
+        .order_by(InvitationModel.created_at.desc())
+    )
+    rows = db.execute(stmt).all()
+
+    filtered: list[InvitationOut] = []
+    for inv, org_name in rows:
+        st = _status(inv)
+        if status and st != status:
+            continue
+        filtered.append(
+            InvitationOut(
+                id=inv.id,
+                organization_id=inv.organization_id,
+                organization_name=str(org_name) if org_name is not None else None,
+                email=inv.email,
+                role=inv.role,
+                status=st,
+                expires_at=inv.expires_at.isoformat(),
+                accepted_at=inv.accepted_at.isoformat() if inv.accepted_at else None,
+                revoked_at=inv.revoked_at.isoformat() if inv.revoked_at else None,
+                created_by_user_id=inv.created_by_user_id,
+                created_at=inv.created_at.isoformat() if inv.created_at else None,
+            )
+        )
+
+    start = int(offset)
+    end = start + int(limit)
+    return filtered[start:end]
+
+
+@router.post("/{invitation_id}/token", response_model=CreateInvitationResponse)
+def issue_receiver_token(
+    invitation_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> CreateInvitationResponse:
+    """Issue a fresh accept token for the receiver (in-app actions).
+
+    Only the invited user (by email/user link) can request a token, and only for pending invitations.
+    """
+    inv = db.get(InvitationModel, invitation_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="INVITATION_NOT_FOUND")
+
+    me_email = str(current_user.email).lower()
+    is_mine = (
+        str(getattr(inv, "email", "")).lower() == me_email
+        or getattr(inv, "invited_user_id", None) == current_user.user_id
+        or getattr(inv, "provisioned_user_id", None) == current_user.user_id
+    )
+    if not is_mine:
+        raise HTTPException(status_code=403, detail="INVITATION_NOT_FOR_YOU")
+    if inv.revoked_at is not None:
+        raise HTTPException(status_code=409, detail="INVITATION_REVOKED")
+    if inv.accepted_at is not None:
+        raise HTTPException(status_code=409, detail="INVITATION_ALREADY_ACCEPTED")
+    if getattr(inv, "declined_at", None) is not None:
+        raise HTTPException(status_code=409, detail="INVITATION_DECLINED")
+    if _ensure_utc(inv.expires_at) <= _now():
+        raise HTTPException(status_code=409, detail="INVITATION_EXPIRED")
+
+    raw = secrets.token_urlsafe(48)
+    inv.token_hash = _hash_token(raw)
+    inv.expires_at = _now() + timedelta(days=7)
+    db.add(inv)
+    db.commit()
+    db.refresh(inv)
+
+    org = db.get(OrganizationModel, inv.organization_id)
+    out = InvitationOut(
+        id=inv.id,
+        organization_id=inv.organization_id,
+        organization_name=getattr(org, "name", None) if org else None,
+        email=inv.email,
+        role=inv.role,
+        status=_status(inv),
+        expires_at=inv.expires_at.isoformat(),
+        accepted_at=inv.accepted_at.isoformat() if inv.accepted_at else None,
+        revoked_at=inv.revoked_at.isoformat() if inv.revoked_at else None,
+        created_by_user_id=inv.created_by_user_id,
+        created_at=inv.created_at.isoformat() if inv.created_at else None,
+    )
+    return CreateInvitationResponse(invitation=out, accept_url=_accept_url(raw))
 
 @router.post("", response_model=CreateInvitationResponse)
 def create_invitation(
@@ -218,9 +328,12 @@ def create_invitation(
     db.add(inv)
     db.commit()
     db.refresh(inv)
+
+    org = db.get(OrganizationModel, tenant.organization_id)
     out = InvitationOut(
         id=inv.id,
         organization_id=inv.organization_id,
+        organization_name=getattr(org, "name", None) if org else None,
         email=inv.email,
         role=inv.role,
         status=_status(inv),
@@ -232,7 +345,6 @@ def create_invitation(
     )
 
     # Queue email notification (outbox) + audit.
-    org = db.get(OrganizationModel, tenant.organization_id)
     inviter = db.get(UserModel, tenant.user_id) if tenant.user_id else None
     payload = {
         "kind": "created",
