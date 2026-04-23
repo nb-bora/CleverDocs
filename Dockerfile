@@ -13,7 +13,10 @@ RUN pip install --no-cache-dir -U pip && \
 
 COPY app ./app
 
-EXPOSE 8000
+COPY start_hf.sh /app/start_hf.sh
+RUN chmod +x /app/start_hf.sh
 
-CMD ["python", "-m", "uvicorn", "app.interfaces.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 7860
+
+CMD ["/app/start_hf.sh"]
 
