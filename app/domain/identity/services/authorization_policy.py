@@ -34,10 +34,11 @@ class AuthorizationPolicy:
     def can_admin_jobs(self, ctx: TenantContext) -> bool:
         return self.is_admin(ctx)
 
-    def can_access_document(self, ctx: TenantContext, *, uploaded_by_user_id: str | None) -> bool:
-        if self.is_admin(ctx):
-            return True
-        return uploaded_by_user_id is not None and uploaded_by_user_id == ctx.user_id
+    def can_access_document(self, ctx: TenantContext, *, uploaded_by_user_id: str | None = None) -> bool:
+        del uploaded_by_user_id
+        # In CleverDocs, documents are organization-owned: any active member can read them.
+        # Upload/delete/admin operations are still controlled by can_upload / role checks elsewhere.
+        return self.can_read(ctx)
 
     def can_delete_organization(self, ctx: TenantContext) -> bool:
         return self.is_owner(ctx)

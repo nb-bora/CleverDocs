@@ -26,10 +26,12 @@ from app.infrastructure.db.session import SessionLocal
 from app.infrastructure.search.search_engine_impl import SearchEngineImpl, SearchEngineSettings
 from app.infrastructure.storage.local_file_storage import LocalFileStorage
 from app.infrastructure.messaging.outbox.outbox_model import OutboxEvent, enqueue_outbox_event
-from app.interfaces.api.deps import Settings, TenantContext, get_db, get_settings, get_tenant_context
+from app.interfaces.api.deps import CurrentUser, Settings, TenantContext, get_current_user, get_db, get_settings, get_tenant_context
 from app.interfaces.api.schemas.documents import DocumentOut, ProcessDocumentResponse, UploadDocumentResponse
 from app.domain.identity.services.authorization_policy import AuthorizationPolicy, TenantContext as DomainTenantContext
 from app.infrastructure.audit.audit_logger import AuditEvent, AuditLogger
+from app.infrastructure.db.orm.models.membership_model import MembershipModel
+from app.infrastructure.db.orm.models.organization_model import OrganizationModel
 
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
@@ -91,12 +93,7 @@ def list_documents(
     if query is not None and query.strip():
         needle = f"%{query.strip()}%"
         q = q.filter(DocumentModel.filename.ilike(needle))
-    if not _authz.is_admin(
-        DomainTenantContext(
-            organization_id=tenant.organization_id, user_id=tenant.user_id, role=tenant.role
-        )
-    ):
-        q = q.filter(DocumentModel.uploaded_by_user_id == tenant.user_id)
+    # Documents are organization-owned: list all docs for members (not just uploader).
     if sort == "updated_desc":
         q = q.order_by(DocumentModel.updated_at.desc())
     elif sort == "name_asc":
@@ -104,7 +101,68 @@ def list_documents(
     else:
         q = q.order_by(DocumentModel.created_at.desc())
     items = q.limit(limit).all()
-    return [DocumentOut.model_validate(d, from_attributes=True) for d in items]
+    org = db.get(OrganizationModel, tenant.organization_id)
+    org_name = getattr(org, "name", None) if org else None
+    return [
+        DocumentOut.model_validate(d, from_attributes=True).model_copy(update={"organization_name": org_name})
+        for d in items
+    ]
+
+
+@router.get("/mine", response_model=list[DocumentOut])
+def list_documents_mine(
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+    include_archived: bool = False,
+    query: Annotated[str | None, Query(max_length=200, alias="q")] = None,
+    status: Annotated[
+        Literal["uploaded", "processing", "processed", "indexed", "archived", "failed", "indexing_failed", "indexing_pending"] | None,
+        Query(),
+    ] = None,
+    sort: Annotated[Literal["created_desc", "updated_desc", "name_asc"], Query()] = "created_desc",
+    limit: Annotated[int, Query(ge=1, le=500)] = 500,
+) -> list[DocumentOut]:
+    """List all documents across all organizations the user belongs to (active memberships)."""
+    memberships = (
+        db.execute(
+            select(MembershipModel).where(MembershipModel.user_id == current_user.user_id).where(MembershipModel.status == "active")
+        )
+        .scalars()
+        .all()
+    )
+    org_ids = [m.organization_id for m in memberships]
+    if not org_ids:
+        return []
+
+    org_rows = (
+        db.execute(select(OrganizationModel.id, OrganizationModel.name).where(OrganizationModel.id.in_(org_ids)))
+        .all()
+    )
+    org_name_by_id = {oid: name for oid, name in org_rows}
+
+    qdb = db.query(DocumentModel).filter(DocumentModel.organization_id.in_(org_ids))
+    qdb = qdb.filter(DocumentModel.status != "deleted")
+    if not include_archived:
+        qdb = qdb.filter(DocumentModel.status != "archived")
+    if status is not None:
+        qdb = qdb.filter(DocumentModel.status == status)
+    if query is not None and query.strip():
+        needle = f"%{query.strip()}%"
+        qdb = qdb.filter(DocumentModel.filename.ilike(needle))
+
+    if sort == "updated_desc":
+        qdb = qdb.order_by(DocumentModel.updated_at.desc())
+    elif sort == "name_asc":
+        qdb = qdb.order_by(DocumentModel.filename.asc())
+    else:
+        qdb = qdb.order_by(DocumentModel.created_at.desc())
+
+    items = qdb.limit(limit).all()
+    out: list[DocumentOut] = []
+    for d in items:
+        o = DocumentOut.model_validate(d, from_attributes=True)
+        out.append(o.model_copy(update={"organization_name": org_name_by_id.get(d.organization_id)}))
+    return out
 
 
 @router.post("/{document_id}/archive", response_model=DocumentOut)
@@ -117,6 +175,8 @@ def archive_document(
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
+    if doc.uploaded_by_user_id != tenant.user_id:
+        raise HTTPException(status_code=403, detail="ONLY_UPLOADER_CAN_ARCHIVE")
     doc.status = "archived"
     db.add(doc)
     db.add(
@@ -142,6 +202,8 @@ def unarchive_document(
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
+    if doc.uploaded_by_user_id != tenant.user_id:
+        raise HTTPException(status_code=403, detail="ONLY_UPLOADER_CAN_ARCHIVE")
     if doc.status == "archived":
         # In MVP, we don't track previous status; restore to processed.
         doc.status = "processed"
@@ -169,6 +231,8 @@ def delete_document(
     doc = db.get(DocumentModel, document_id)
     if doc is None or not _can_access_document(tenant=tenant, doc=doc):
         raise HTTPException(status_code=404, detail="Document not found")
+    if doc.uploaded_by_user_id != tenant.user_id:
+        raise HTTPException(status_code=403, detail="ONLY_UPLOADER_CAN_DELETE")
     doc.status = "deleted"
     db.add(doc)
     db.add(

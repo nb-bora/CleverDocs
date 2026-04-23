@@ -10,6 +10,8 @@ from pydantic import BaseModel
 class DocumentOut(BaseModel):
     id: str
     organization_id: str | None = None
+    organization_name: str | None = None
+    uploaded_by_user_id: str | None = None
     filename: str
     status: str
     storage_key: str
